@@ -1,0 +1,84 @@
+From 5d15f2ed6f55ef855afa36df06ff0cc6e9fa825a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 08:14:59 +0000
+Subject: [PATCH 4/4] web: Element.typeText types into a text field at its
+ caret
+
+As if typed: it joins the field's undo history and an input event follows,
+where setting value wipes the history. An editor's Tab and Enter need it to
+indent without breaking Ctrl+Z. execCommand("insertText") where the
+browser has it, setRangeText and an input event where it does not.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J7c8hTEmTN5s7KvmrRMqXX
+---
+ packages/web/src/element.wac        | 16 ++++++++++++++++
+ packages/web/test/wac/page_test.wac |  3 +++
+ packages/web/tools/build.wac        | 11 +++++++++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/packages/web/src/element.wac b/packages/web/src/element.wac
+index 90fe6644c..9d72e8cc4 100644
+--- a/packages/web/src/element.wac
++++ b/packages/web/src/element.wac
+@@ -295,6 +295,22 @@ export struct Element {
+     this.es.ops.prop(this.id, "selection", "\{start},\{end}", this.es.seen);
+   }
+ 
++  /**
++   * Type `text` into this text field at its caret, replacing what is selected — as the browser would
++   * for a keystroke, so it joins the field's own undo history and an `input` event follows. A program
++   * that sets `value` instead wipes that history, which is why an editor's Tab and Enter use this.
++   *
++   * Like `select`, it does not land over typing the program has not seen: typed at the caret after a key
++   * the user pressed later, it would arrive in the wrong place — `if (x) {i⏎` rather than an indent
++   * before the `i`. So a program typing for a key it intercepted can lose that key when the user types
++   * on faster than the page answers, and never misplace it. Where the browser can do the key itself —
++   * Enter — let it, and type only what follows, which is lost rather than misplaced the same way.
++   */
++  void typeText(this, string text) {
++    this.alive("typeText");
++    this.es.ops.prop(this.id, "insertText", text, this.es.seen);
++  }
++
+   void focus(this) {
+     this.alive("focus");
+     this.es.ops.focus(this.id);
+diff --git a/packages/web/test/wac/page_test.wac b/packages/web/test/wac/page_test.wac
+index ed735a47c..3b2807e3f 100644
+--- a/packages/web/test/wac/page_test.wac
++++ b/packages/web/test/wac/page_test.wac
+@@ -348,5 +348,8 @@ export string test_an_event_in_a_text_field_says_where_the_caret_is_and_a_progra
+   seen.log = "";
+   field.select(3, 3);
+   t.eqStr(seen.log, "prop 1 selection 3,3 2\n", "and select sends the range, with the events seen");
++  seen.log = "";
++  field.typeText("  ");
++  t.eqStr(seen.log, "prop 1 insertText    2\n", "and typeText sends what to type at the caret");
+   return t.report();
+ }
+diff --git a/packages/web/tools/build.wac b/packages/web/tools/build.wac
+index a941a1502..43bd16da4 100644
+--- a/packages/web/tools/build.wac
++++ b/packages/web/tools/build.wac
+@@ -621,6 +621,17 @@ export string documentSide() {
+             if (name === "value") {
+               if ((n.__wacTyped ?? 0) > seen) return;
+               if (n.value !== value) n.value = value;
++            } else if (name === "insertText") {
++              // As if typed, so it is undoable and an input event follows; setRangeText where the
++              // browser no longer offers execCommand.
++              if ((n.__wacTyped ?? 0) > seen) return;
++              if (n !== document.activeElement && n.focus) n.focus();
++              if (!document.execCommand || !document.execCommand("insertText", false, value)) {
++                if (n.setRangeText) {
++                  n.setRangeText(value, n.selectionStart, n.selectionEnd, "end");
++                  n.dispatchEvent(new Event("input", { bubbles: true }));
++                }
++              }
+             } else if (name === "selection") {
+               if ((n.__wacTyped ?? 0) > seen || !n.setSelectionRange) return;
+               const [a, b] = value.split(",").map(Number);
+-- 
+2.43.0
+

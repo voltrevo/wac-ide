@@ -56,8 +56,11 @@ const check = (ok, what, seen) => { if (!ok) failed++; console.log(`${ok ? 'ok  
   check((await texts('.slot:not(.hidden) .lens')).length === 1 && !!(await p.$('.slot:not(.hidden) .squig.err')), 'and on its line', await texts('.slot:not(.hidden) .lens'));
   check((await text('.tnode.on .cnt')) === '1' && !!(await p.$('.tab.on.err')), 'and on the file, in the tree and its tab', await text('.tnode.on .cnt'));
   await shot('1-error');
-  await p.locator('.prow').first().click(); await settle(300);
+  await p.locator('.prow').first().click(); await settle(500);
   check(!!(await p.$('.slot:not(.hidden) .flash')), 'a problem clicked brings its line forward', null);
+  const broken = (await editor().inputValue()).split('\n');
+  const errAt = broken.slice(0, 10).reduce((n, l) => n + l.length + 1, 0) + 29;
+  check((await editor().evaluate((el) => el.selectionStart)) === errAt, 'and puts the caret on it', [await editor().evaluate((el) => el.selectionStart), errAt]);
   await editor().fill(original);
   await checked();
   check((await text('.status')) === 'No problems', 'and fixing it clears it', await text('.status'));
@@ -79,6 +82,35 @@ const check = (ok, what, seen) => { if (!ok) failed++; console.log(`${ok ? 'ok  
   check(download.suggestedFilename() === 'main.wasm' && wasm.slice(0, 4).toString('hex') === '0061736d', 'Build downloads a wasm module', [download.suggestedFilename(), wasm.slice(0, 4)]);
   await settle(300);
   check((await text('.toast')).includes('Built main.wasm'), 'and says so', await text('.toast'));
+
+  // What a name is, and where it is declared: from the caret, with F12, and with Ctrl+click.
+  await p.locator('.tab', { hasText: 'main.wac' }).click(); await settle(300);
+  const mainText = await editor().inputValue();
+  const callAt = mainText.indexOf('double(21)') + 2;
+  const caretTo = (at) => editor().evaluate((el, at) => { el.focus(); el.setSelectionRange(at, at); }, at);
+  await caretTo(callAt); await p.keyboard.press('ArrowRight'); await settle(1500);
+  check(/Ln 6, Col 14/.test(await text('.bar')), 'the status bar says where the caret is', await text('.bar'));
+  check((await text('.card')).includes('export i32 double(i32 x)') && (await text('.card')).includes('Twice'), 'resting on a name shows what it is: its declaration and its doc', await text('.card'));
+  await shot('3-card');
+  await p.keyboard.press('F12'); await settle(1200);
+  const utilText = await editor().inputValue();
+  check((await text('.tab.on .nm')) === 'util.wac' && (await editor().evaluate((el) => el.selectionStart)) === utilText.indexOf('double'), 'F12 goes to where it is declared, caret and all', [await text('.tab.on .nm'), await editor().evaluate((el) => el.selectionStart)]);
+  await p.locator('.tab', { hasText: 'main.wac' }).click(); await settle(300);
+  const charW = await p.evaluate(() => { const s = document.createElement('span'); s.className = 'chunk'; s.style.cssText = 'position:absolute;height:auto'; s.textContent = 'x'.repeat(100); document.querySelector('.slot:not(.hidden) .layer').appendChild(s); const w = s.getBoundingClientRect().width / 100; s.remove(); return w; });
+  const lineOf = mainText.slice(0, callAt).split('\n').length - 1, colOf = callAt - mainText.lastIndexOf('\n', callAt - 1) - 1;
+  await editor().click({ modifiers: ['Control'], position: { x: 16 + (colOf + 0.5) * charW, y: 10 + (lineOf + 0.5) * 20 } }); await settle(1200);
+  check((await text('.tab.on .nm')) === 'util.wac', 'and so does Ctrl+click', await text('.tab.on .nm'));
+
+  // Enter keeps the indent, Tab indents, and Ctrl+Z undoes both.
+  await p.locator('.tab', { hasText: 'main.wac' }).click(); await settle(300);
+  await caretTo(mainText.indexOf('sys) {') + 6);
+  await p.keyboard.press('Enter'); await settle(300); await p.keyboard.type('i32 z = 1;'); await settle(400);
+  check((await editor().inputValue()).includes('sys) {\n  i32 z = 1;\n'), 'Enter after an opening brace indents the next line', (await editor().inputValue()).slice(0, 120));
+  await p.keyboard.press('Home'); await p.keyboard.press('Tab'); await settle(400);
+  check((await editor().inputValue()).includes('\n  i32 z = 1;'.replace('  i32', '    i32').replace('    i32', '  ' + '  i32')) || (await editor().inputValue()).includes('{\n    i32 z'), 'Tab indents', (await editor().inputValue()).slice(60, 120));
+  for (let k = 0; k < 6 && (await editor().inputValue()) !== mainText; k++) { await p.keyboard.press('Control+z'); await settle(150); }
+  check((await editor().inputValue()) === mainText, 'and Ctrl+Z takes it all back', (await editor().inputValue()).slice(60, 120));
+  await checked();
 
   await p.keyboard.press('Control+p'); await settle(300);
   await p.keyboard.type('util'); await settle(300);

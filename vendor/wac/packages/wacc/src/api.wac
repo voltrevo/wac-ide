@@ -33,6 +33,7 @@ import { enumVariantsIn } from "./scans.wac";
 import { KeyIndex, keyAdd, keyFirst } from "./keyindex.wac";
 import { manifestOf, withManifestSection } from "./manifest.wac";
 import { renderDiagnostics } from "./render.wac";
+import { Found, Q, Src, Walk, baseOf, docAbove, globalDef, memberDef, walkFile } from "./query.wac";
 import { importSpecs, importSpecsLexed } from "./files.wac";
 import { isProjectSpec, Res, resolveFrom, resolveFromAt, resolveFromIn, resolveVia, startsWith } from "./path.wac";
 import { Frontend, frontendOf, readLexed, readOf, readParsedLexed, readProgram, Reads, readSrc } from "./frontend.wac";
@@ -824,6 +825,105 @@ export string diagnoseGraph(string[] paths, string[] sources, string entry) {
  */
 export string diagnoseGraphIn(string[] paths, string[] rawSources, const Res res, string entry) {
   return diagnoseGraphTallied(paths, rawSources, res, entry, i32[].filled(2, 0));
+}
+
+// ── an editor's questions about one position ────────────────────────────────
+
+/**
+ * What the token at byte `offset` of `file` is — its type, and where it is declared — for an editor's
+ * hover and go-to-definition. One line per fact, fields between tabs, any of them absent when unknown:
+ *
+ *     token  <start>  <end>                   the token asked about, in bytes
+ *     type   <type>                           what the checker says it is, as diagnostics spell types
+ *     def    <path>  <line>  <col>  <kind>    where it is declared; kind is "local", "parameter",
+ *                                             "function", "struct", "enum", "field", "method",
+ *                                             "variant", "static", "type" or "import"
+ *     sig    <text>                           the declaration's line, as written
+ *     doc    <text>                           its doc comment, a line each
+ *
+ * The definition is found by reading (`query.wac`); the type, and the receiver's type that a member's
+ * definition needs, by checking `file` against its closure with a probe on the token (`C.probeTok`) —
+ * the same check `diagnoseGraphIn` runs for it, so a hover costs what checking that one file does.
+ */
+export string queryIn(string[] paths, string[] rawSources, const Res res, string file, i32 offset) {
+  string[] sources = lowerSources(paths, rawSources, res);
+  string[] qp = string[].filled(paths.len() + 2, "");
+  string[] qs = string[].filled(paths.len() + 2, "");
+  for (i32 i = 0; i < paths.len(); i++) { qp[i] = paths[i]; qs[i] = i < sources.len() ? sources[i] : ""; }
+  qp[paths.len()] = "core";
+  qs[paths.len()] = coreSource();
+  qp[paths.len() + 1] = "std";
+  qs[paths.len() + 1] = stdSource();
+  // A copy: `res` is `const` here, and the ladder that builds this compiler refuses a `const` parameter.
+  Q q = Q.create(qp, qs, paths, Res(res.roots, res.mapFrom, res.mapSpec, res.mapTo, res.base));
+  Src? found = q.load(file);
+  if (found is null) { return ""; }
+  Src s = found!;
+  i32 tok = s.tokenAt(offset);
+  if (tok < 0) { return ""; }
+  string out = "token\t" + numText(s.start(tok)) + "\t" + numText(s.start(tok) + s.len(tok)) + "\n";
+  C c = probeIn(paths, sources, res, file, tok);
+  string type = c.probeType;
+  if (type != "" && type != "?" && type != "unknown") { out = out + "type\t" + displayTypes(type) + "\n"; }
+  Walk w = walkFile(s, tok);
+  Found? def = null;
+  if (w.found == "decl" || w.found == "local") { def = Found(s, w.declTok, w.declKind, 0 - 1); }
+  else if (w.found == "global") { def = globalDef(q, s, s.text(tok), 0); }
+  else if (w.found == "member") {
+    string owner = c.probeOwner;
+    // `Vec.create()` and `E.A` name a type, which has no value to have a type: the type is the name.
+    if (owner == "" && w.owner is not null) {
+      match (w.owner!.kind) {
+        Ident(ot): { owner = s.text(ot); }
+        default: { }
+      }
+    }
+    if (owner != "") { def = memberDef(q, s, owner, s.text(tok)); }
+  }
+  if (def is not null) {
+    Found d = def!;
+    out = out + "def\t" + d.src.path + "\t" + numText(d.src.line(d.tok)) + "\t" + numText(d.src.col(d.tok)) + "\t" + d.kind + "\n";
+    string sig = d.src.lineText(d.src.line(d.tok));
+    while (sig.len() > 0 && (sig.slice(0, 1) == " " || sig.slice(0, 1) == "\t")) { sig = sig.slice(1, sig.len()); }
+    out = out + "sig\t" + sig + "\n";
+    string[] doc = docAbove(d.src, d.src.line(d.tok));
+    for (i32 i = 0; i < doc.len(); i++) { out = out + "doc\t" + trimSpaces(doc[i]) + "\n"; }
+  }
+  return out;
+}
+
+/** Check `file` against its closure, as `diagnoseGraphTallied` does, with a probe on token `probe`. */
+C probeIn(string[] paths, string[] sources, const Res res, string file, i32 probe) {
+  Lexed?[] lexes = Lexed?[].defaulted(paths.len() + 1);
+  Program?[] progs = Program?[].defaulted(paths.len() + 1);
+  string[] fronts = string[].filled(paths.len(), "");
+  i32[] counts = declCountsAndFronts(paths, sources, lexes, progs, fronts);
+  Edges edges = edgesOfIn(paths, sources, res, lexes);
+  i32 at0 = 0 - 1;
+  for (i32 i = 0; i < paths.len(); i++) { if (paths[i] == file) { at0 = i; } }
+  i32[] seen = i32[].filled(paths.len(), 0);
+  i32 n = at0 < 0 ? 0 : closureFrom(edges, at0, seen);
+  string[] subPaths = string[].filled(n, "");
+  string[] subSources = string[].filled(n + 1, "");
+  i32[] subCounts = i32[].filled(n + 1, 0);
+  Lexed?[] subLexes = Lexed?[].defaulted(n + 1);
+  Program?[] subProgs = Program?[].defaulted(n + 1);
+  string[] subRoots = string[].filled(n, "");
+  for (i32 k = 0; k < n; k++) {
+    i32 at = seen[k];
+    subPaths[k] = paths[at];
+    subSources[k] = at < sources.len() ? sources[at] : "";
+    subCounts[k] = at < counts.len() ? counts[at] : 0;
+    subLexes[k] = at < lexes.len() ? lexes[at] : null;
+    subProgs[k] = at < progs.len() ? progs[at] : null;
+    subRoots[k] = at < res.roots.len() ? res.roots[at] : "";
+  }
+  subCounts[n] = counts[paths.len()];
+  subSources[n] = coreSource();
+  subLexes[n] = lexes[paths.len()];
+  subProgs[n] = progs[paths.len()];
+  Res subRes = Res(subRoots, res.mapFrom, res.mapSpec, res.mapTo, res.base);
+  return checkFilesProbedIn(subPaths, subSources, subRes, file, subCounts, subLexes, subProgs, "", "", "", probe);
 }
 
 /**
@@ -1669,6 +1769,14 @@ C checkFilesWithIn(string[] callerPaths, string[] callerSources, Res res, string
 C checkFilesAutoIn(string[] callerPaths, string[] callerSources, const Res res, string entry,
                    i32[] counts, Lexed?[] lexes, Program?[] progs, string assume, string target,
                    string placeholder) {
+  return checkFilesProbedIn(callerPaths, callerSources, res, entry, counts, lexes, progs, assume, target,
+                            placeholder, 0 - 1);
+}
+
+/** `checkFilesAutoIn`, answering an editor's question about token `probe` of the entry (`C.probeTok`). */
+C checkFilesProbedIn(string[] callerPaths, string[] callerSources, const Res res, string entry,
+                     i32[] counts, Lexed?[] lexes, Program?[] progs, string assume, string target,
+                     string placeholder, i32 probe) {
   // **`core` is a file, and the checker had never read it.** An import from `core` used to declare
   // each name as *unknown*, so a `Node` or a `Read` had no enum behind it — and every rule that asks
   // what an enum holds went quiet: a `match` missing a variant, an arm naming a variant that does
@@ -2217,6 +2325,7 @@ C checkFilesAutoIn(string[] callerPaths, string[] callerSources, const Res res, 
     c.autoAssume = assume;
     c.autoTarget = target;
   }
+  c.probeTok = probe;
   checkModule(c, eprog);
   return c;
 }

@@ -151,6 +151,13 @@ export string css() {
     .flash { position: absolute; left: calc(-1 * var(--padx)); right: calc(-1 * var(--padx)); height: var(--lh);
              background: color-mix(in oklab, var(--accent) 22%, transparent); animation: flash 1.6s ease-out forwards; }
     @keyframes flash { 0%, 40% { opacity: 1; } 100% { opacity: 0; } }
+    .card { position: absolute; z-index: 4; margin-top: 4px; max-width: min(640px, 70vw); padding: 8px 12px; border-radius: 9px; pointer-events: auto;
+            background: var(--panel); border: 1px solid var(--line-2); box-shadow: 0 16px 40px -16px rgb(10 10 40 / .45);
+            font: 12.5px/1.5 ui-sans-serif, system-ui, sans-serif; white-space: normal; }
+    .card .ctype { color: var(--hy); font-weight: 600; font-size: 12.5px; }
+    .card .csig { margin: 4px 0 0; padding: 6px 8px; border-radius: 6px; background: var(--panel-2); white-space: pre-wrap; font-size: 12px; }
+    .card .cdoc { color: var(--text); margin-top: 4px; }
+    .card .cwhere { color: var(--faint); margin-top: 6px; font-size: 11.5px; }
     .ednote { display: grid; place-items: center; height: 100%; color: var(--muted); }
 
     /* ── problems ── */

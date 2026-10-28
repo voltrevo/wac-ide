@@ -3,9 +3,19 @@
 Kept as the IDE is built: each item says what it would enable, what the IDE does instead today, and
 where in wac it lives. Most important first. Measured against wac `25a34468`.
 
+**Items 1 and 4 now have an implementation**, on wac branch `ide-queries` (in `wac-patches/`), which the
+IDE is built against. They are written as proposals for wac: take them, change them, or say what should
+be different.
+
 ## For the editor
 
-### 1. The caret and the selection of a text field
+### 1. The caret and the selection of a text field — *done on `ide-queries`*
+
+**Done as:** `ElementEvent.selStart` and `selEnd` on every event from an `<input>` or `<textarea>` (-1
+elsewhere); `Element.select(start, end)`, which like a rendered value does not land over typing the
+program has not seen; and `Element.typeText(text)`, which types at the caret as the browser would — so
+it is undoable — with the same guard. The IDE uses them for Tab, Enter's indent, line:column, and putting
+the caret on a problem or a definition.
 
 **Wanted:** read a textarea's selection (`selectionStart`, `selectionEnd`) — in each `input` and key event,
 say — and set it.
@@ -45,7 +55,14 @@ type.
 
 **Where:** `lib.wac` at the repository root.
 
-### 4. Answers to "what is at this position"
+### 4. Answers to "what is at this position" — *done on `ide-queries`*
+
+**Done as:** `queryIn(paths, sources, res, file, offset)` in `packages/wacc/src/api.wac`, answering the
+token's type, where it is declared, that line, and its doc comment. Definitions are found by reading
+(`query.wac`: scopes, the file's top level, imports through export lists, members through the receiver's
+type); types come from a probe in the checker (`probe.wac`, `C.probeTok`) that records the type of the
+expression keyed by the token as the statement holding it is checked. Completion, find references and
+rename would build on the same two halves.
 
 **Wanted:** given a file and an offset — the declaration a name refers to, the type of an expression, the
 names in scope there.
@@ -68,6 +85,22 @@ cold — but the compiler still lowers and checks the whole graph each time.
 
 **Where:** `packages/wacc` — `gatherNeeded` already keeps `Reads` and `Parsed` caches keyed by text across
 its rounds; something like them across checks.
+
+### 4a. Which character the pointer is over
+
+**Wanted:** in a pointer event over a text field, the text offset under the pointer — or a way to measure
+an element, so a program can work it out from `x`, `y` and the width of a character.
+
+**Would enable:** hover with the mouse. **Instead:** the card follows the caret, and Ctrl+click works
+because a click moves the caret first.
+
+### 4b. Faster answers about a position
+
+**Wanted:** `queryIn` without re-checking the file's whole closure — the checker's per-function work
+kept between queries, say, or a query that checks only the function holding the token.
+
+**Instead:** a query costs what checking the file does: about 0.2 s for a small file, 1–2 s in
+`emit.wac`. The IDE asks only once the caret has rested, and only on a name.
 
 ## For running things
 

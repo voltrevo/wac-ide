@@ -13,8 +13,9 @@ what it would like from wac — keep it current, it is how this project talks to
 
 ## Building and testing
 
-wac is pinned to `25a34468` everywhere (`wac.json5`, `wac.lock`, `vendor/wac/VENDORED.md`, and the
-`wac` command itself). Change them together; `wac task vendor <wac checkout>` re-copies the vendored part.
+wac is pinned to the head of wac branch `ide-queries` everywhere: `wac.json5`, `wac.lock`,
+`vendor/wac/VENDORED.md`, and the `wac` command itself. The branch is not on GitHub; `wac-patches/README.md`
+says how to get it. Change them together; `wac task vendor <wac checkout>` re-copies the vendored part.
 
     wac task build && wac task test && wac task test:ide
 

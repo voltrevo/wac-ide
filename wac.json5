@@ -1,10 +1,10 @@
 {
   imports: {
     // wac's packages, as one dependency — `import { gzip.inflateResult } from "wac"`.
-    wac: { git: 'https://github.com/voltrevo/wac', ref: '25a34468293a1eeb0fa6dbd9fb8b002e98eec735' },
+    wac: { git: 'https://github.com/voltrevo/wac', ref: '5d15f2ed6f55ef855afa36df06ff0cc6e9fa825a' },
     // The page a program is handed.
-    web: { git: 'https://github.com/voltrevo/wac', ref: '25a34468293a1eeb0fa6dbd9fb8b002e98eec735', subdir: './packages/web' },
+    web: { git: 'https://github.com/voltrevo/wac', ref: '5d15f2ed6f55ef855afa36df06ff0cc6e9fa825a', subdir: './packages/web' },
     // The page builder `build.wac` calls.
-    webbuild: { git: 'https://github.com/voltrevo/wac', ref: '25a34468293a1eeb0fa6dbd9fb8b002e98eec735', subdir: './packages/web/tools' },
+    webbuild: { git: 'https://github.com/voltrevo/wac', ref: '5d15f2ed6f55ef855afa36df06ff0cc6e9fa825a', subdir: './packages/web/tools' },
   },
 }

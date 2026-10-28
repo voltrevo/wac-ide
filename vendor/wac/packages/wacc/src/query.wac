@@ -1,0 +1,556 @@
+// What a name is: an editor's questions about one position — where it is declared, and what it says
+// there — answered from the syntax of the files a program is made of.
+//
+// **Resolution is the language's own, done by reading.** A name in a body is the nearest declaration
+// above it in an enclosing scope — a local, a parameter, a loop variable, a match binding, a lambda's
+// parameter — and failing that a top-level declaration of its file, or a name one of its imports brings
+// in, followed through `export { … } from` to where it is declared. A member `a.b` is found in the
+// declaration of `a`'s type, and its parents; that type is the checker's answer (`C.probeOwner`), since
+// only checking knows it. `api.wac`'s `queryIn` puts the two halves together.
+//
+// **Written in the subset the bootstrap ladder compiles**, as the rest of this package is: no `Map` or
+// `Vec`, no lambdas — growable arrays by hand, and the resolver called rather than passed in.
+//
+// None of this changes what the compiler accepts. Where the reading here and the checker could disagree
+// — a name shadowed in a way this walk does not model — the answer is a wrong jump, not a wrong program.
+
+import { Arm, Decl, DeclKind, Expr, ExprKind, Field, ImportItem, Lvalue, LvalueKind, Method, Param, Program, Stmt,
+         StmtKind, TupleBinding, Variant, lvalueExpr } from "./ast.wac";
+import { Lexed, lex, tokenStride } from "./lex.wac";
+import { P, parseProgram } from "./parse.wac";
+import { kIdent, kThis } from "./kinds.wac";
+import { Res, resolveVia } from "./path.wac";
+import { isBuiltinSpec } from "./coretext.wac";
+
+/** A file, lexed and parsed once for every question about it. */
+export struct Src {
+  string path;
+  u8[] src;
+  Lexed lexed;
+  Program prog;
+
+  Src of(string path, string text) {
+    u8[] b = text.toBytes();
+    Lexed lx = lex(b);
+    return Src(path, b, lx, parseProgram(P.create(b, lx)));
+  }
+
+  i32 kind(const this, i32 t) { return this.lexed.tokens[t * tokenStride()]; }
+  i32 start(const this, i32 t) { return this.lexed.tokens[t * tokenStride() + 1]; }
+  i32 len(const this, i32 t) { return this.lexed.tokens[t * tokenStride() + 2]; }
+  i32 line(const this, i32 t) { return this.lexed.tokens[t * tokenStride() + 3]; }
+  i32 col(const this, i32 t) { return this.lexed.tokens[t * tokenStride() + 4]; }
+
+  string text(const this, i32 t) {
+    if (t < 0 || t >= this.lexed.tokenCount) { return ""; }
+    i32 s = this.start(t);
+    u8[] out = u8[].filled(this.len(t), 0 as u8);
+    for (i32 i = 0; i < out.len(); i++) { out[i] = this.src[s + i]; }
+    return string.fromBytes(out);
+  }
+
+  /** The token at byte `offset` — or ending there, as a caret just after a name is — preferring a name. */
+  i32 tokenAt(const this, i32 offset) {
+    i32 best = -1;
+    for (i32 t = 0; t < this.lexed.tokenCount; t++) {
+      i32 s = this.start(t);
+      i32 n = this.len(t);
+      if (n <= 0 || s > offset) { continue; }
+      if (offset < s + n || offset == s + n) {
+        bool named = this.kind(t) == kIdent() || this.kind(t) == kThis();
+        if (best < 0 || named) { best = t; }
+        if (named && offset < s + n) { return t; }
+      }
+    }
+    return best;
+  }
+
+  /** The line `line` (from 1), without its newline. */
+  string lineText(const this, i32 line) {
+    i32 at = 1;
+    i32 s = 0;
+    for (i32 i = 0; i < this.src.len() && at < line; i++) { if (this.src[i] == '\n') { at++; s = i + 1; } }
+    i32 e = s;
+    while (e < this.src.len() && this.src[e] != '\n') { e++; }
+    u8[] out = u8[].filled(e - s, 0 as u8);
+    for (i32 i = 0; i < out.len(); i++) { out[i] = this.src[s + i]; }
+    return string.fromBytes(out);
+  }
+}
+
+/** Where something is declared: a file, the token naming it there, and what kind of thing it is. */
+export struct Found {
+  Src src;
+  i32 tok;
+  /** "local", "parameter", "function", "struct", "enum", "field", "method", "variant", "static", "type", "module". */
+  string kind;
+  /** The top-level declaration it is, or is in; -1 for none. */
+  i32 decl;
+}
+
+/**
+ * The files of one program, and how one names another: `paths` and `sources` are the program's, with
+ * `core` and `std` among them; `resPaths` and `res` are what `resolveVia` resolves a specifier against.
+ * Each file is lexed and parsed the first time it is asked for, and kept, by its index in `paths`.
+ */
+export struct Q {
+  string[] paths;
+  string[] sources;
+  string[] resPaths;
+  Res res;
+  Src?[] parsed;
+
+  Q create(string[] paths, string[] sources, string[] resPaths, Res res) {
+    return Q(paths, sources, resPaths, res, Src?[].defaulted(paths.len()));
+  }
+
+  string resolve(this, string from, string spec) {
+    if (isBuiltinSpec(spec)) { return spec; }
+    return resolveVia(this.res, this.resPaths, from, spec);
+  }
+
+  Src? load(this, string path) {
+    for (i32 i = 0; i < this.paths.len(); i++) {
+      if (this.paths[i] != path || i >= this.sources.len()) { continue; }
+      Src? have = this.parsed[i];
+      if (have is not null) { return have; }
+      Src s = Src.of(path, this.sources[i]);
+      this.parsed[i] = s;
+      return s;
+    }
+    return null;
+  }
+}
+
+// ── top-level names ─────────────────────────────────────────────────────────
+
+/** The name a top-level declaration declares, and what kind of thing it is; -1 for none. */
+i32 declName(Decl d) {
+  return match (d.kind) {
+    Func(nameTok, rt, params, body, exported, tps, isAsync): nameTok,
+    StructDecl(nameTok, parentTok, fields, methods, exported, isConst, tps): nameTok,
+    EnumDecl(nameTok, variants, exported, methods, tps): nameTok,
+    StaticDecl(nameTok, type, init, exported): nameTok,
+    SymbolDecl(nameTok, exported): nameTok,
+    TypeDecl(nameTok, tps, alias, body, exported): nameTok,
+    default: 0 - 1,
+  };
+}
+
+string declKind(Decl d) {
+  return match (d.kind) {
+    Func(nameTok, rt, params, body, exported, tps, isAsync): "function",
+    StructDecl(nameTok, parentTok, fields, methods, exported, isConst, tps): "struct",
+    EnumDecl(nameTok, variants, exported, methods, tps): "enum",
+    StaticDecl(nameTok, type, init, exported): "static",
+    SymbolDecl(nameTok, exported): "static",
+    TypeDecl(nameTok, tps, alias, body, exported): "type",
+    default: "",
+  };
+}
+
+string unquote(string q) { return q.len() >= 2 ? q.slice(1, q.len() - 1) : q; }
+
+/**
+ * Where `name`, as `file` sees it at the top level, is declared: one of its own declarations, or one an
+ * import brings in. `depth` stops a cycle of re-exports.
+ */
+export Found? globalDef(Q q, Src file, string name, i32 depth) {
+  if (depth > 16 || name == "") { return null; }
+  Decl[] ds = file.prog.decls;
+  for (i32 d = 0; d < ds.len(); d++) {
+    i32 t = declName(ds[d]);
+    if (t >= 0 && file.text(t) == name) { return Found(file, t, declKind(ds[d]), d); }
+  }
+  for (i32 d = 0; d < ds.len(); d++) {
+    match (ds[d].kind) {
+      Import(pathTok, prefixTok, items): {
+        if (pathTok < 0) { continue; }
+        for (i32 i = 0; i < items.len(); i++) {
+          string orig = file.text(items[i].nameTok);
+          string local = items[i].aliasTok >= 0 ? file.text(items[i].aliasTok) : orig;
+          if (local != name) { continue; }
+          Src? target = q.load(q.resolve(file.path, unquote(file.text(pathTok))));
+          if (target is null) { return Found(file, items[i].nameTok, "import", d); }
+          Found? there = exportedDef(q, target!, orig, depth + 1);
+          return there is not null ? there : Found(file, items[i].nameTok, "import", d);
+        }
+      }
+      default: { }
+    }
+  }
+  return null;
+}
+
+/** Where `name`, as `file` exports it, is declared — through `export { … } from …` if need be. */
+Found? exportedDef(Q q, Src file, string name, i32 depth) {
+  Decl[] ds = file.prog.decls;
+  for (i32 d = 0; d < ds.len(); d++) {
+    match (ds[d].kind) {
+      ExportList(pathTok, items): {
+        for (i32 i = 0; i < items.len(); i++) {
+          string orig = file.text(items[i].nameTok);
+          string local = items[i].aliasTok >= 0 ? file.text(items[i].aliasTok) : orig;
+          if (local != name) { continue; }
+          if (pathTok < 0) { return globalDef(q, file, orig, depth + 1); }
+          Src? target = q.load(q.resolve(file.path, unquote(file.text(pathTok))));
+          return target is null ? null : exportedDef(q, target!, orig, depth + 1);
+        }
+      }
+      default: { }
+    }
+  }
+  return globalDef(q, file, name, depth + 1);
+}
+
+// ── members ─────────────────────────────────────────────────────────────────
+
+/** `Vec<string>?` is a `Vec`: the declaration a type's members are in. */
+export string baseOf(string type) {
+  string t = type;
+  while (t.len() > 0 && (t.slice(t.len() - 1, t.len()) == "?" || t.slice(t.len() - 1, t.len()) == "!")) { t = t.slice(0, t.len() - 1); }
+  i32 lt = t.indexOf("<");
+  if (lt > 0) { t = t.slice(0, lt); }
+  i32 dot = -1;
+  u8[] b = t.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '.') { dot = i; } }
+  if (dot >= 0) { t = t.slice(dot + 1, t.len()); }
+  return t;
+}
+
+/** The declaration of type `name` as `file` sees it — or, failing that, anywhere in the program. */
+Found? typeDef(Q q, Src file, string name) {
+  Found? f = globalDef(q, file, name, 0);
+  if (f is not null && f!.decl >= 0) { return f; }
+  for (i32 i = 0; i < q.paths.len(); i++) {
+    Src? s = q.load(q.paths[i]);
+    if (s is null) { continue; }
+    Decl[] ds = s!.prog.decls;
+    for (i32 d = 0; d < ds.len(); d++) {
+      string k = declKind(ds[d]);
+      if ((k == "struct" || k == "enum") && s!.text(declName(ds[d])) == name) { return Found(s!, declName(ds[d]), k, d); }
+    }
+  }
+  return null;
+}
+
+/** Member `member` of the type declared at `t`: a field, a method or a variant — or one of its parent's. */
+Found? memberIn(Q q, Found t, string member, i32 depth) {
+  if (depth > 16 || t.decl < 0) { return null; }
+  Src s = t.src;
+  match (s.prog.decls[t.decl].kind) {
+    StructDecl(nameTok, parentTok, fields, methods, exported, isConst, tps): {
+      for (i32 i = 0; i < fields.len(); i++) { if (s.text(fields[i].nameTok) == member) { return Found(s, fields[i].nameTok, "field", t.decl); } }
+      for (i32 i = 0; i < methods.len(); i++) { if (s.text(methods[i].nameTok) == member) { return Found(s, methods[i].nameTok, "method", t.decl); } }
+      if (parentTok >= 0) {
+        Found? p = typeDef(q, s, s.text(parentTok));
+        if (p is not null) { return memberIn(q, p!, member, depth + 1); }
+      }
+    }
+    EnumDecl(nameTok, variants, exported, methods, tps): {
+      for (i32 i = 0; i < variants.len(); i++) { if (s.text(variants[i].nameTok) == member) { return Found(s, variants[i].nameTok, "variant", t.decl); } }
+      for (i32 i = 0; i < methods.len(); i++) { if (s.text(methods[i].nameTok) == member) { return Found(s, methods[i].nameTok, "method", t.decl); } }
+    }
+    default: { }
+  }
+  return null;
+}
+
+/** Where member `member` of a value of type `ownerType` is declared, as `file` sees the type. */
+export Found? memberDef(Q q, Src file, string ownerType, string member) {
+  Found? t = typeDef(q, file, baseOf(ownerType));
+  return t is null ? null : memberIn(q, t!, member, 0);
+}
+
+// ── the token in a body ─────────────────────────────────────────────────────
+
+/** What walking a body found about the token: where it is declared if that is a local, else what it keys. */
+export struct Walk {
+  i32 tok;
+  /** The scope as it stands: each name declared, the token that declared it, and what it is — `n` of them. */
+  string[] names;
+  i32[] toks;
+  string[] kinds;
+  i32 n;
+  /** "" until the token is met; then "local" (see `declTok`), "global" (an unshadowed name), "member", or "decl". */
+  string found;
+  i32 declTok;
+  string declKind;
+  /** For "member", the receiver. */
+  Expr? owner;
+}
+
+Walk newWalk(i32 tok) {
+  return Walk(tok, string[].filled(64, ""), i32[].filled(64, 0), string[].filled(64, ""), 0, "", 0 - 1, "", null);
+}
+
+void bind(Walk w, Src s, i32 tok, string kind) {
+  if (tok < 0) { return; }
+  if (tok == w.tok && w.found == "") { w.found = "decl"; w.declTok = tok; w.declKind = kind; }
+  if (w.n == w.names.len()) {
+    string[] names = string[].filled(w.n * 2, "");
+    i32[] toks = i32[].filled(w.n * 2, 0);
+    string[] kinds = string[].filled(w.n * 2, "");
+    for (i32 i = 0; i < w.n; i++) { names[i] = w.names[i]; toks[i] = w.toks[i]; kinds[i] = w.kinds[i]; }
+    w.names = names;
+    w.toks = toks;
+    w.kinds = kinds;
+  }
+  w.names[w.n] = s.text(tok);
+  w.toks[w.n] = tok;
+  w.kinds[w.n] = kind;
+  w.n = w.n + 1;
+}
+
+void named(Walk w, Src s, i32 tok) {
+  if (tok != w.tok || w.found != "") { return; }
+  string n = s.text(tok);
+  for (i32 i = w.n - 1; i >= 0; i--) {
+    if (w.names[i] == n) { w.found = "local"; w.declTok = w.toks[i]; w.declKind = w.kinds[i]; return; }
+  }
+  w.found = "global";
+}
+
+i32 mark(Walk w) { return w.n; }
+void unwind(Walk w, i32 to) { if (w.n > to) { w.n = to; } }
+
+void walkExprs(Walk w, Src s, Expr[] xs) { for (i32 i = 0; i < xs.len() && w.found == ""; i++) { walkExpr(w, s, xs[i]); } }
+void walkOpt(Walk w, Src s, Expr? e) { if (e is not null) { walkExpr(w, s, e!); } }
+
+void walkExpr(Walk w, Src s, Expr e) {
+  if (w.found != "") { return; }
+  match (e.kind) {
+    Ident(t): { named(w, s, t); }
+    Member(obj, nameTok): {
+      walkExpr(w, s, obj);
+      if (w.found == "" && nameTok == w.tok) { w.found = "member"; w.owner = obj; }
+    }
+    SafeMember(obj, nameTok): {
+      walkExpr(w, s, obj);
+      if (w.found == "" && nameTok == w.tok) { w.found = "member"; w.owner = obj; }
+    }
+    MatchExpr(subject, arms): { walkExpr(w, s, subject); walkArms(w, s, arms); }
+    Jsx(tagTok, closeTok, attrs, kids): {
+      if (tagTok == w.tok || closeTok == w.tok) { w.found = "global"; return; }
+      for (i32 i = 0; i < attrs.len(); i++) { walkExpr(w, s, attrs[i].value); }
+      walkExprs(w, s, kids);
+    }
+    Unary(op, operand): { walkExpr(w, s, operand); }
+    Await(operand): { walkOpt(w, s, operand); }
+    Try(operand): { walkExpr(w, s, operand); }
+    CoroutineOf(call): { walkExpr(w, s, call); }
+    Binary(op, left, right): { walkExpr(w, s, left); walkExpr(w, s, right); }
+    Cast(op, operand, target): { walkExpr(w, s, operand); }
+    Is(left, target, other, negated): { walkExpr(w, s, left); walkOpt(w, s, other); }
+    Matches(pattern, subject): {
+      walkExpr(w, s, subject);
+      // What a pattern binds is in scope after it, for the rest of the condition and what it guards.
+      bind(w, s, pattern.nameTok, "local");
+      for (i32 i = 0; i < pattern.slotNames.len(); i++) { bind(w, s, pattern.slotNames[i], "local"); }
+      if (pattern.variantTok == w.tok && w.found == "") { w.found = "global"; }
+    }
+    Ternary(cond, then, els): { walkExpr(w, s, cond); walkExpr(w, s, then); walkExpr(w, s, els); }
+    Call(callee, args, typeArgs): { walkExpr(w, s, callee); walkExprs(w, s, args); }
+    Index(arr, index): { walkExpr(w, s, arr); walkExpr(w, s, index); }
+    SafeCall(call): { walkExpr(w, s, call); }
+    Unwrap(operand): { walkExpr(w, s, operand); }
+    Construct(ctype, args, named): {
+      walkExprs(w, s, args);
+      for (i32 i = 0; i < named.len(); i++) { walkExpr(w, s, named[i].value); }
+    }
+    StaticTrapE(message): { walkExpr(w, s, message); }
+    Incr(target, op, prefix): { walkExpr(w, s, lvalueExpr(target)); }
+    ArrNew(elem, size, fill, elements): { walkOpt(w, s, size); walkOpt(w, s, fill); walkExprs(w, s, elements); }
+    ArrLit(elements): { walkExprs(w, s, elements); }
+    TupleLit(elements): { walkExprs(w, s, elements); }
+    StaticMatch(subject, types, values, defaultAt): { walkExprs(w, s, values); }
+    Lambda(params, body, isAsync): {
+      i32 m = mark(w);
+      for (i32 i = 0; i < params.len(); i++) { bind(w, s, params[i].nameTok, "parameter"); }
+      walkStmts(w, s, body);
+      unwind(w, m);
+    }
+    default: { }
+  }
+}
+
+void walkArms(Walk w, Src s, Arm[] arms) {
+  for (i32 i = 0; i < arms.len() && w.found == ""; i++) {
+    if (arms[i].variantTok == w.tok) { w.found = "global"; return; }
+    i32 m = mark(w);
+    for (i32 k = 0; k < arms[i].bindingToks.len(); k++) { bind(w, s, arms[i].bindingToks[k], "local"); }
+    walkOpt(w, s, arms[i].value);
+    walkStmts(w, s, arms[i].body);
+    unwind(w, m);
+  }
+}
+
+void walkBinding(Walk w, Src s, TupleBinding b) {
+  bind(w, s, b.nameTok, "local");
+  for (i32 i = 0; i < b.kids.len(); i++) { walkBinding(w, s, b.kids[i]); }
+}
+
+void walkStmts(Walk w, Src s, Stmt[] xs) {
+  i32 m = mark(w);
+  for (i32 i = 0; i < xs.len() && w.found == ""; i++) { walkStmt(w, s, xs[i]); }
+  unwind(w, m);
+}
+
+void walkOptStmt(Walk w, Src s, Stmt? st) { if (st is not null) { walkStmt(w, s, st!); } }
+
+void walkStmt(Walk w, Src s, Stmt st) {
+  if (w.found != "") { return; }
+  match (st.kind) {
+    Var(type, nameTok, init, isConst): { walkOpt(w, s, init); bind(w, s, nameTok, "local"); }
+    StaticLocal(type, nameTok, init): { walkExpr(w, s, init); bind(w, s, nameTok, "local"); }
+    Assign(target, op, rhs): { walkExpr(w, s, lvalueExpr(target)); walkExpr(w, s, rhs); }
+    IncrStmt(target, op): { walkExpr(w, s, lvalueExpr(target)); }
+    If(cond, then, els): { walkExpr(w, s, cond); walkStmts(w, s, then); walkStmts(w, s, els); }
+    While(cond, body): { walkExpr(w, s, cond); walkStmts(w, s, body); }
+    For(init, cond, update, body): {
+      i32 m = mark(w);
+      walkOptStmt(w, s, init);
+      walkOpt(w, s, cond);
+      walkOptStmt(w, s, update);
+      walkStmts(w, s, body);
+      unwind(w, m);
+    }
+    ForIn(type, nameTok, iterable, body): {
+      walkExpr(w, s, iterable);
+      i32 m = mark(w);
+      bind(w, s, nameTok, "local");
+      walkStmts(w, s, body);
+      unwind(w, m);
+    }
+    Destructure(type, pattern, init): { walkExpr(w, s, init); walkBinding(w, s, pattern); }
+    TupleAssign(targets, rhs): {
+      for (i32 i = 0; i < targets.len(); i++) { walkExpr(w, s, lvalueExpr(targets[i])); }
+      walkExpr(w, s, rhs);
+    }
+    DoWhile(body, cond): { walkStmts(w, s, body); walkExpr(w, s, cond); }
+    Switch(subject, cases): {
+      walkExpr(w, s, subject);
+      for (i32 i = 0; i < cases.len(); i++) { walkOpt(w, s, cases[i].value); walkStmts(w, s, cases[i].body); }
+    }
+    Return(value): { walkOpt(w, s, value); }
+    Trap(value): { walkOpt(w, s, value); }
+    Match(subject, arms): { walkExpr(w, s, subject); walkArms(w, s, arms); }
+    Block(body): { walkStmts(w, s, body); }
+    ExprStmt(expr): { walkExpr(w, s, expr); }
+    Defer(body): { walkStmt(w, s, body); }
+    Schedule(target): { walkExpr(w, s, target); }
+    Yield(value): { walkOpt(w, s, value); }
+    StaticIf(cond, then, els): { walkExpr(w, s, cond); walkStmts(w, s, then); walkStmts(w, s, els); }
+    StaticTrap(message): { walkExpr(w, s, message); }
+    StaticFor(init, cond, update, body): {
+      i32 m = mark(w);
+      walkOptStmt(w, s, init);
+      walkOpt(w, s, cond);
+      walkOptStmt(w, s, update);
+      walkStmts(w, s, body);
+      unwind(w, m);
+    }
+    default: { }
+  }
+}
+
+void walkBody(Walk w, Src s, Param[] params, Stmt[] body) {
+  i32 m = mark(w);
+  for (i32 i = 0; i < params.len(); i++) { bind(w, s, params[i].nameTok, "parameter"); }
+  walkStmts(w, s, body);
+  unwind(w, m);
+}
+
+void walkMethods(Walk w, Src s, Method[] methods, string owner) {
+  for (i32 i = 0; i < methods.len() && w.found == ""; i++) {
+    if (methods[i].nameTok == w.tok) { w.found = "decl"; w.declTok = w.tok; w.declKind = "method"; return; }
+    walkBody(w, s, methods[i].params, methods[i].body);
+  }
+}
+
+/**
+ * Walk every body in `s` looking for token `tok`: what it names, or that it is itself a declaration.
+ * `w.decl` says which top-level declaration it is in.
+ */
+export Walk walkFile(Src s, i32 tok) {
+  Walk w = newWalk(tok);
+  Decl[] ds = s.prog.decls;
+  for (i32 d = 0; d < ds.len() && w.found == ""; d++) {
+    if (declName(ds[d]) == tok) { w.found = "decl"; w.declTok = tok; w.declKind = declKind(ds[d]); return w; }
+    match (ds[d].kind) {
+      Func(nameTok, rt, params, body, exported, tps, isAsync): { walkBody(w, s, params, body); }
+      StructDecl(nameTok, parentTok, fields, methods, exported, isConst, tps): {
+        if (parentTok == tok) { w.found = "global"; return w; }
+        for (i32 i = 0; i < fields.len(); i++) {
+          if (fields[i].nameTok == tok) { w.found = "decl"; w.declTok = tok; w.declKind = "field"; return w; }
+          walkOpt(w, s, fields[i].init);
+        }
+        walkMethods(w, s, methods, s.text(nameTok));
+      }
+      EnumDecl(nameTok, variants, exported, methods, tps): {
+        for (i32 i = 0; i < variants.len(); i++) {
+          if (variants[i].nameTok == tok) { w.found = "decl"; w.declTok = tok; w.declKind = "variant"; return w; }
+        }
+        walkMethods(w, s, methods, s.text(nameTok));
+      }
+      StaticDecl(nameTok, type, init, exported): { walkExpr(w, s, init); }
+      TypeDecl(nameTok, tps, alias, body, exported): { walkStmts(w, s, body); }
+      Import(pathTok, prefixTok, items): {
+        for (i32 i = 0; i < items.len(); i++) {
+          if (items[i].nameTok == tok || items[i].aliasTok == tok) { w.found = "global"; return w; }
+        }
+      }
+      ExportList(pathTok, items): {
+        for (i32 i = 0; i < items.len(); i++) {
+          if (items[i].nameTok == tok || items[i].aliasTok == tok) { w.found = "global"; return w; }
+        }
+      }
+      default: { }
+    }
+  }
+  // Not in any expression a body holds — a type's name in a declaration, say: a name at the top level.
+  if (w.found == "" && (s.kind(tok) == kIdent())) { w.found = "global"; }
+  return w;
+}
+
+/** The declaration's doc comment — a block comment or `//` lines just above `line` — as plain lines. */
+export string[] docAbove(Src s, i32 line) {
+  // Read upwards, so collected last-first, then turned round.
+  string[] up = string[].filled(64, "");
+  i32 n = 0;
+  i32 l = line - 1;
+  bool block = false;
+  while (l >= 1 && n < up.len()) {
+    string t = s.lineText(l);
+    string trimmed = t;
+    while (trimmed.len() > 0 && (trimmed.slice(0, 1) == " " || trimmed.slice(0, 1) == "\t")) { trimmed = trimmed.slice(1, trimmed.len()); }
+    if (trimmed.len() >= 2 && trimmed.slice(0, 2) == "*/") { block = true; l = l - 1; continue; }
+    if (block) {
+      if (trimmed.len() >= 3 && trimmed.slice(0, 3) == "/**") {
+        string rest = trimmed.slice(3, trimmed.len());
+        if (rest.len() > 0) { up[n] = rest; n = n + 1; }
+        break;
+      }
+      string body = trimmed.len() >= 1 && trimmed.slice(0, 1) == "*" ? trimmed.slice(1, trimmed.len()) : trimmed;
+      up[n] = body;
+      n = n + 1;
+      l = l - 1;
+      continue;
+    }
+    if (trimmed.len() >= 2 && trimmed.slice(0, 2) == "//") {
+      up[n] = trimmed.slice(2, trimmed.len());
+      n = n + 1;
+      l = l - 1;
+      continue;
+    }
+    // A one-line block comment.
+    if (trimmed.len() >= 5 && trimmed.slice(0, 3) == "/**" && trimmed.slice(trimmed.len() - 2, trimmed.len()) == "*/") {
+      up[n] = trimmed.slice(3, trimmed.len() - 2);
+      n = n + 1;
+    }
+    break;
+  }
+  string[] out = string[].filled(n, "");
+  for (i32 i = 0; i < n; i++) { out[i] = up[n - 1 - i]; }
+  return out;
+}

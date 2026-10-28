@@ -4,7 +4,8 @@ import { Diag, errorCount, inFile, parseWire } from "../src/diag.wac";
 import { Span, classOf, spansOf } from "../src/highlight.wac";
 import { commonTop, ignored, projectName } from "../src/store.wac";
 import { Inbox, Outcome, framed, num, putMessage, tabbed } from "../src/checker.wac";
-import { Doc, dirty, newDoc, retext } from "../src/editor.wac";
+import { Doc, byteOf, dirty, lineAt, newDoc, newlineAt, offsetOf, retext, u16Of } from "../src/editor.wac";
+import { Info, parseInfo } from "../src/info.wac";
 import { score } from "../src/ide.wac";
 
 export string test_diagnostics_read_from_the_wire() {
@@ -107,5 +108,32 @@ export string test_the_checkers_messages_survive_being_cut_up() {
     if (got == 1 && (head[0] != "put" || string.fromBytes(body) != "line one\nline two\n")) { return "put: \{head[0]} \{string.fromBytes(body)}"; }
   }
   if (head[0] != "check" || num(head[1]) != 7 || num(head[2]) != 3 || string.fromBytes(body) != "x\t1\t1\tcheck\tbad\n") { return "answer"; }
+  return "";
+}
+
+export string test_what_a_name_is_reads_back() {
+  Info? i = parseInfo("p/a.wac", "token\t10\t16\ntype\tfn<i32(i32)>\ndef\tp/b.wac\t2\t12\tfunction\nsig\texport i32 double(i32 x) { return x * 2; }\ndoc\tTwice `x`.\n");
+  if (i is null) { return "nothing read"; }
+  if (i!.start != 10 || i!.end != 16 || i!.type != "fn<i32(i32)>" || i!.defPath != "p/b.wac" || i!.defLine != 2 || i!.defCol != 12) { return "fields"; }
+  if (i!.kind != "function" || i!.sig != "export i32 double(i32 x) { return x * 2; }" || i!.doc.len() != 1 || i!.doc[0] != "Twice `x`.") { return "sig and doc"; }
+  if (parseInfo("p/a.wac", "") is not null) { return "an empty answer is nothing"; }
+  return "";
+}
+
+export string test_the_caret_converts_between_the_browsers_count_and_bytes() {
+  string t = "aéb\u{1F600}c";   // 1, 2, 1, 4, 1 bytes; 1, 1, 1, 2, 1 UTF-16 units
+  if (byteOf(t, 0) != 0 || byteOf(t, 2) != 3 || byteOf(t, 3) != 4 || byteOf(t, 5) != 8 || byteOf(t, 6) != 9) { return "byteOf"; }
+  if (u16Of(t, 3) != 2 || u16Of(t, 8) != 5 || u16Of(t, 9) != 6) { return "u16Of"; }
+  Doc d = newDoc("x.wac");
+  retext(d, "ab\ncd\nef");
+  if (lineAt(d, 0) != 1 || lineAt(d, 3) != 2 || lineAt(d, 8) != 3 || offsetOf(d, 3, 2) != 7) { return "lines"; }
+  return "";
+}
+
+export string test_enter_keeps_the_indent_and_adds_one_after_an_opener() {
+  if (newlineAt("  x = 1;", 8) != "\n  ") { return "keeps"; }
+  if (newlineAt("  if (x) {", 10) != "\n    ") { return "adds after {"; }
+  if (newlineAt("f(", 2) != "\n  ") { return "adds after ("; }
+  if (newlineAt("a\n    b", 7) != "\n    ") { return "the line the caret is on"; }
   return "";
 }

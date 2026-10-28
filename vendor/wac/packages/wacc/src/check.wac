@@ -45,6 +45,7 @@ import { endsWith, startsWith } from "./path.wac";
 import { flattenUnion, isUnionName, spellUnion, unionMembers } from "./unions.wac";
 import { genericArgs, genericBase, isTupleName, tupleMembers, tupleName } from "./tuples.wac";
 import { methodUsesOwnerLetters } from "./ownerletters.wac";
+import { Hit, inStmt } from "./probe.wac";
 import {
   kPlus, kMinus, kStar, kSlash, kPercent, kAnd, kOr, kCaret,
   kLt, kLe, kGt, kGe, kEq, kNe, kAndAnd, kOrOr, kAssign, kBang,
@@ -3958,6 +3959,15 @@ export struct C {
    */
   i32 relexed;
   i32 coreBuilt;
+  /**
+   * **An editor's question about one token**, answered as the check passes it (`probeStmt`): the token,
+   * or -1 when nobody asked; then what it turned out to be ("expr" or "decl", "" until found), its type,
+   * and — for `a.b` — the type of `a`, which is what says where `b` is declared.
+   */
+  i32 probeTok;
+  string probeWhat;
+  string probeType;
+  string probeOwner;
 
   void noteMarkup(this, Expr e, string k) {
     if (this.markupAtN >= this.markupAtE.len()) {
@@ -4080,7 +4090,7 @@ export struct C {
              i32[](), string[](), 0,
              string[](), 0, "", bool[].filled(decls, false), "", string[](), string[](), 0, string[](), 0,
              string[](), string[](), "", "", "", "", "", null, null, 0 - 1, "", 0 - 1, "", "", "", "", "", "", 0, null, "|",
-             Expr[](), string[](), 0, "", 0, "|", 0, 0);
+             Expr[](), string[](), 0, "", 0, "|", 0, 0, 0 - 1, "", "", "");
   }
 
   /**
@@ -13184,7 +13194,30 @@ string runtimeNameIn(C c, string why) {
 }
 
 /** Every `return` in a statement, however deeply nested, checked against `want`. */
+/** Check `s` — and, when an editor asked about a token, see whether `s` holds it (`probeStmt`). */
 void checkStmt(C c, Stmt s, Ty want) {
+  checkStmtOnly(c, s, want);
+  if (c.probeTok >= 0 && c.probeWhat == "") { probeStmt(c, s); }
+}
+
+/**
+ * The probe: if `s`'s own expressions hold the token asked about, record its type now — after the
+ * statement is checked, with exactly the names in scope that it saw. Nested statements were checked
+ * inside `s` and asked first, so the first statement to answer is the innermost.
+ */
+void probeStmt(C c, Stmt s) {
+  Hit h = inStmt(s, c.probeTok, Expr(ExprKind.BoolLit(false), s.line, s.col));
+  if (h.what == "") { return; }
+  c.probeWhat = h.what;
+  if (h.what == "decl") {
+    c.probeType = c.typeOfName(tokenText(c, c.probeTok));
+    return;
+  }
+  c.probeType = typeOfExpr(c, h.expr);
+  if (h.owner is not null) { c.probeOwner = typeOfExpr(c, h.owner!); }
+}
+
+void checkStmtOnly(C c, Stmt s, Ty want) {
   match (s.kind) {
     // **The branch not taken is not checked** (spec ch31 `§wac-static-if-cphqxuz`): that is the
     // whole difference from an `if` with a constant condition. One this checker cannot decide checks both.

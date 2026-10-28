@@ -1,6 +1,6 @@
 # Vendored from wac
 
-Copied by `tools/vendor_wac.py` from wac `25a34468293a1eeb0fa6dbd9fb8b002e98eec735`: 49 files, 77,240 lines, from 6 packages (fmt, fs, json, wac, wacc, wacpkg).
+Copied by `tools/vendor_wac.py` from wac `5d15f2ed6f55ef855afa36df06ff0cc6e9fa825a`: 51 files, 78,102 lines, from 6 packages (fmt, fs, json, wac, wacc, wacpkg).
 
 Do not edit these files: change wac, then run the script again. When wac's root library exports the compiler and the `wac` command's gathering, import them that way and delete this directory.
 
@@ -41,7 +41,9 @@ Do not edit these files: change wac, then run the script again. When wac's root 
 - `packages/wacc/src/parse.wac`
 - `packages/wacc/src/path.wac`
 - `packages/wacc/src/print.wac`
+- `packages/wacc/src/probe.wac`
 - `packages/wacc/src/program.wac`
+- `packages/wacc/src/query.wac`
 - `packages/wacc/src/reach.wac`
 - `packages/wacc/src/render.wac`
 - `packages/wacc/src/scans.wac`

@@ -10,6 +10,11 @@ checking your code as you type. Built for real projects, up to the wac repositor
 - **Checking** runs on the file in front and everything it imports, in a process of its own, so typing
   never waits for it. Problems show in a panel, in the status, on the file in the tree and its tab, and on
   the line itself — underlined, with the message at the end of the line. Click one to go to it.
+- **What a name is**: rest the caret on a name and a card under it shows its type, its declaration as
+  written, its doc comment and where it is declared. **F12** or **Ctrl+click** goes there — across files,
+  through imports, to a field or a method by the type of what it is on.
+- **Typing**: Tab indents and Enter keeps the indent (one more after `{`, `(` or `[`), both undoable with
+  Ctrl+Z; the status bar says where the caret is. Clicking a problem puts the caret on it.
 - **Build** compiles the file in front and downloads the `.wasm` module.
 - **Ctrl+P** goes to any file by name; **+** makes a new file in the selected folder.
 
@@ -25,10 +30,11 @@ Serve it: over http the browser gives it storage, and the checker its own proces
 disk (`file://`) it still works, but keeps nothing after the tab closes, and checks inside the page, so
 typing can pause during a long check.
 
-**Everything is pinned to wac
-[`25a34468`](https://github.com/voltrevo/wac/commit/25a34468293a1eeb0fa6dbd9fb8b002e98eec735)**: the `wac`
-command should be bootstrapped from it (see the desktop project's README for the steps), `wac.json5` names
-it as every wac dependency's `ref`, `wac.lock` agrees, and `vendor/wac/` was copied from it.
+**Everything is pinned to one wac commit** — the `wac` command should be bootstrapped from it, `wac.json5`
+names it as every wac dependency's `ref`, `wac.lock` agrees, and `vendor/wac/` was copied from it. That
+commit is the head of `ide-queries`, a branch of wac **not yet on GitHub**: four commits on top of wac
+`25a34468` that the IDE needs (the caret in `web`, and `queryIn` in the compiler). They travel with this
+project as `wac-patches/` — see there to build it.
 
 ## How fast, on the wac repository
 
@@ -42,6 +48,7 @@ Measured in headless Chromium (`tools/ide_scale.js`):
 | Check `json.wac` (8 files) | 0.2 s |
 | Check `emit.wac` (22 files): first, then after an edit | 1.7 s, then 0.7 s |
 | Check `wac.wac`, the `wac` command (236 files), first time | about 6 s |
+| What the name at the caret in `emit.wac` is, or F12 from it into `asynclower.wac` | about 1.2 s |
 
 ## How it is put together
 
@@ -71,6 +78,6 @@ Measured in headless Chromium (`tools/ide_scale.js`):
 
 ## Not yet
 
-Run and test (they need wac to run a module in a page), go to definition, hover and completion (they need
-the compiler to answer questions about a position), find and replace across files, renaming and deleting
-files, Tab to indent (it needs the caret), git. `docs/wac-wishlist.md` says what each would need from wac.
+Run and test (they need wac to run a module in a page), completion, find references and rename (they
+build on `queryIn`), hover with the mouse rather than the caret (a page cannot tell which column the
+pointer is over), find and replace across files, renaming and deleting files, git. `docs/wac-wishlist.md` says what each would need from wac.

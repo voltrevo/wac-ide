@@ -12,9 +12,10 @@
 // is drawn again. A comment opened above a chunk changes its colours, and redraws it too.
 
 import { Buf, Vec } from "core";
-import { ElementEvent, Node, Ref, Ui, html.div, html.pre, html.span, html.textarea } from "web";
+import { ElementEvent, MOD_CTRL, MOD_META, Node, Ref, Ui, html.div, html.pre, html.span, html.textarea } from "web";
 import { Span, spansOf } from "./highlight.wac";
 import { Diag } from "./diag.wac";
+import { Info } from "./info.wac";
 
 static i32 CHUNK = 50;
 
@@ -37,10 +38,17 @@ export struct Doc {
   /** A line to bring into view, and a number that changes each time it is asked. */
   i32 jumpLine;
   i32 jumpSeq;
+  /** Where to put the caret when it is brought into view, in bytes; -1 to leave it. */
+  i32 jumpByte;
+  /** The caret, in bytes, as the last key or click left it. */
+  i32 caret;
+  /** Enter was pressed at byte `enterAt`: the indent to type once its newline arrives, or "". */
+  string indent;
+  i32 enterAt;
 }
 
 export Doc newDoc(string path) {
-  return Doc(path, "", "", false, false, Span[](), [0], 0, 0, 0, 0);
+  return Doc(path, "", "", false, false, Span[](), [0], 0, 0, 0, 0, 0 - 1, 0, "", 0 - 1);
 }
 
 /** Take in new text: its lines and colours. Only `.wac` is coloured. */
@@ -63,6 +71,71 @@ export void retext(Doc d, string text) {
   d.widest = widest;
   d.spans = d.path.len() > 4 && d.path.slice(d.path.len() - 4, d.path.len()) == ".wac" ? spansOf(text) : Span[]();
   d.version++;
+}
+
+// ── where the caret is ──
+//
+// A textarea counts its selection in UTF-16 code units; the compiler, and everything here, counts bytes
+// of UTF-8. The same for ASCII, which is most source, and converted by walking the text where not.
+
+/** The byte offset of UTF-16 position `u16` in `text`. */
+export i32 byteOf(string text, i32 u16) {
+  u8[] b = text.toBytes();
+  i32 units = 0;
+  i32 i = 0;
+  while (i < b.len() && units < u16) {
+    u8 c = b[i];
+    i32 len = c < 0x80 ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+    units = units + (len == 4 ? 2 : 1);
+    i = i + len;
+  }
+  return i > b.len() ? b.len() : i;
+}
+
+/** The UTF-16 position of byte offset `at` in `text`. */
+export i32 u16Of(string text, i32 at) {
+  u8[] b = text.toBytes();
+  i32 units = 0;
+  i32 i = 0;
+  while (i < b.len() && i < at) {
+    u8 c = b[i];
+    i32 len = c < 0x80 ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+    units = units + (len == 4 ? 2 : 1);
+    i = i + len;
+  }
+  return units;
+}
+
+/** The line (from 1) byte `at` is on. */
+export i32 lineAt(Doc d, i32 at) {
+  i32 lo = 0;
+  i32 hi = d.starts.len() - 1;
+  while (lo < hi) {
+    i32 mid = (lo + hi + 1) / 2;
+    if (d.starts[mid] <= at) { lo = mid; } else { hi = mid - 1; }
+  }
+  return lo + 1;
+}
+
+/** The byte offset of `line`, `col` (both from 1). */
+export i32 offsetOf(Doc d, i32 line, i32 col) {
+  i32 l = line < 1 ? 0 : (line > d.starts.len() ? d.starts.len() - 1 : line - 1);
+  i32 at = d.starts[l] + col - 1;
+  return at > d.text.len() ? d.text.len() : at;
+}
+
+/** What Enter types at byte `at`: a newline, the line's own indent, and one more after an opener. */
+export string newlineAt(string text, i32 at) {
+  u8[] b = text.toBytes();
+  i32 s = at;
+  while (s > 0 && b[s - 1] != '\n') { s--; }
+  i32 e = s;
+  while (e < at && (b[e] == ' ' || b[e] == '\t')) { e++; }
+  string indent = text.slice(s, e);
+  i32 p = at;
+  while (p > s && (b[p - 1] == ' ' || b[p - 1] == '\t')) { p--; }
+  bool opens = p > s && (b[p - 1] == '{' || b[p - 1] == '(' || b[p - 1] == '[');
+  return "\n" + indent + (opens ? "  " : "");
 }
 
 export bool dirty(Doc d) { return d.loaded && !d.binary && d.text != d.saved; }
@@ -153,11 +226,29 @@ Node mark(Doc d, Diag g, i32 more) {
   </>;
 }
 
+/** What the card under the caret says: the name's type, its declaration, and its doc comment. */
+Node card(Doc doc, Info info) {
+  i32 line = lineAt(doc, info.start);
+  i32 col = info.start - doc.starts[line - 1];
+  Node[] doc2 = Node[].filled(info.doc.len(), Node.Text(""));
+  for (i32 i = 0; i < info.doc.len(); i++) { doc2[i] = <div class="cdoc">{info.doc[i]}</div>; }
+  string where = info.defPath == "" ? "" : (info.kind + (info.defPath == doc.path ? "" : " in " + info.defPath) + ", line \{info.defLine}");
+  return <div class="card" style={"top:calc(var(--lh) * \{line});left:\{col}ch"}>
+    {info.type != "" ? <div class="ctype mono">{info.type}</div> : Node.Text("")}
+    {info.sig != "" ? <pre class="csig mono">{info.sig}</pre> : Node.Text("")}
+    {doc2}
+    {where != "" ? <div class="cwhere">{where}{info.defPath != "" ? " — F12 or Ctrl+click to go there" : ""}</div> : Node.Text("")}
+  </div>;
+}
+
 /**
  * A file, editable. `diags` are this file's diagnostics, and `diagKey` names them, so the editor redraws
- * when they change; `onEdit` hears each edit after the document has taken it in.
+ * when they change; `onEdit` hears each edit after the document has taken it in. `onCaret` hears where
+ * the caret came to rest, in bytes; `onDefinition` asks to go to where the name at a byte is declared.
+ * `info` is what is known about the name at the caret, shown in a card under it; `infoKey` names it.
  */
-export Node Editor(Ui ui, Doc doc, i32 version, Diag[] diags, string diagKey, i32 jumpSeq, i32 focusSeq, fn<void()> onEdit) {
+export Node Editor(Ui ui, Doc doc, i32 version, Diag[] diags, string diagKey, i32 jumpSeq, i32 focusSeq, Info? info,
+                   string infoKey, fn<void()> onEdit, fn<void(i32)> onCaret, fn<void(i32)> onDefinition) {
   Ref area = ui.ref();
   Ref target = ui.ref();
   // Focused when it comes to the front — `focusSeq` changes — or when its file arrives after that.
@@ -165,8 +256,17 @@ export Node Editor(Ui ui, Doc doc, i32 version, Diag[] diags, string diagKey, i3
     if (focusSeq > 0 && area.element() is not null) { area.element()!.focus(); }
     return () => { };
   });
-  ui.effect("\{jumpSeq}", () => {
+  // A jump brings its line into view and — when it says where — puts the caret there.
+  ui.effect("\{jumpSeq}|\{doc.loaded}", () => {
     if (jumpSeq > 0 && target.element() is not null) { target.element()!.scrollIntoView(); }
+    if (jumpSeq > 0 && doc.jumpByte >= 0 && area.element() is not null) {
+      i32 at = u16Of(doc.text, doc.jumpByte);
+      area.element()!.focus();
+      area.element()!.select(at, at);
+      doc.caret = doc.jumpByte;
+      doc.jumpByte = 0 - 1;
+      onCaret(doc.caret);
+    }
     return () => { };
   });
   if (!doc.loaded) { return <div class="ednote">Opening…</div>; }
@@ -206,10 +306,46 @@ export Node Editor(Ui ui, Doc doc, i32 version, Diag[] diags, string diagKey, i3
             {marks}
             <div class={jumpSeq > 0 ? "jump on" : "jump"} key={"j\{jumpSeq}"} ref={target} style={"top:calc(var(--lh) * \{jl - 3 < 0 ? 0 : jl - 3})"}></div>
             {jumpSeq > 0 ? <div class="flash" key={"f\{jumpSeq}"} style={"top:calc(var(--lh) * \{jl})"}></div> : Node.Text("")}
+            {info is not null && info!.path == doc.path ? card(doc, info!) : Node.Text("")}
           </div>
           <textarea class="input" ref={area} spellcheck="false" autocomplete="off" value={doc.text}
-                    prevent="Tab"
-                    oninput={(ElementEvent e) => { retext(doc, e.value); onEdit(); }}></textarea>
+                    prevent="Tab F12"
+                    onkeydown={(ElementEvent e) => {
+                      if (e.selStart < 0 || area.element() is null) { return; }
+                      i32 at = byteOf(doc.text, e.selStart);
+                      // Tab indents, typed through the browser so that Ctrl+Z undoes it. Enter is left to
+                      // the browser, and the indent it should carry is typed once its newline arrives —
+                      // see `typeText` for why a key is never typed for ahead of what the user typed.
+                      if (e.value == "Tab") { area.element()!.typeText("  "); }
+                      else if (e.value == "Enter" && e.mods == 0) {
+                        doc.indent = newlineAt(doc.text, at).slice(1, newlineAt(doc.text, at).len());
+                        doc.enterAt = at;
+                      }
+                      else if (e.value == "F12") { onDefinition(at); }
+                    }}
+                    onkeyup={(ElementEvent e) => {
+                      if (e.selStart < 0) { return; }
+                      doc.caret = byteOf(doc.text, e.selStart);
+                      onCaret(doc.caret);
+                    }}
+                    onclick={(ElementEvent e) => {
+                      if (e.selStart < 0) { return; }
+                      doc.caret = byteOf(doc.text, e.selStart);
+                      if ((e.mods & (MOD_CTRL | MOD_META)) != 0) { onDefinition(doc.caret); } else { onCaret(doc.caret); }
+                    }}
+                    oninput={(ElementEvent e) => {
+                      retext(doc, e.value);
+                      string indent = doc.indent;
+                      i32 enterAt = doc.enterAt;
+                      doc.indent = "";
+                      doc.enterAt = 0 - 1;
+                      // The newline Enter made, just behind the caret: now its indent.
+                      if (indent != "" && e.selStart >= 0 && area.element() is not null
+                          && byteOf(doc.text, e.selStart) == enterAt + 1 && doc.text.slice(enterAt, enterAt + 1) == "\n") {
+                        area.element()!.typeText(indent);
+                      }
+                      onEdit();
+                    }}></textarea>
         </div>
       </div>
     </div>

@@ -17,9 +17,11 @@
 //                      reset\n                         forget everything (a manifest changed)
 //                      check\t<id>\t<entry>\n          check what <entry> reaches
 //                      build\t<id>\t<entry>\n          compile <entry> to a module
+//                      query\t<id>\t<file>\t<offset>\n  what the name at byte <offset> of <file> is
 //     checker → page   <kind>\t<id>\t<files>\t<ms>\t<n>\n<n bytes>
 //
-// where the answer's kind is `check` (the bytes are the diagnostics wire), `wasm` (a module) or `error`
+// where the answer's kind is `check` (the bytes are the diagnostics wire), `query` (wacc's `queryIn`
+// answer: the name's type, where it is declared, and its doc), `wasm` (a module) or `error`
 // (why there is neither). A page opened from a file cannot start workers from its own, so there the
 // same `Engine` runs inside the page instead — slower to type beside, and otherwise the same.
 
@@ -27,7 +29,7 @@ import { Buf, Map, Ticket, Vec, hashString, stringEq } from "core";
 import { Cli, Core, FileResult, GRANT_READ, HostChild, Sys } from "std";
 import { Fs } from "../vendor/wac/packages/fs/src/fs.wac";
 import { ReadCache, Sources, exactly, gatherNeeded, gatherWith, resOf } from "../vendor/wac/packages/wac/src/sources.wac";
-import { blockedFilesIn, diagnoseGraphIn, emitFilesIn } from "../vendor/wac/packages/wacc/src/api.wac";
+import { blockedFilesIn, diagnoseGraphIn, emitFilesIn, queryIn } from "../vendor/wac/packages/wacc/src/api.wac";
 
 /** What a check or a build came to. */
 export struct Outcome {
@@ -65,6 +67,13 @@ export struct Engine {
   void reset(this) { this.cache = ReadCache.create(); }
 
   async Outcome run(this, string kind, i32 id, string entry) {
+    // A query is `file\toffset`, asked of the program that file is the entry of.
+    i32 offset = 0;
+    if (kind == "query") {
+      i32 tab = entry.indexOf("\t");
+      offset = num(entry.slice(tab + 1, entry.len()));
+      entry = entry.slice(0, tab);
+    }
     i64 t0 = this.core.nowMillis().wait();
     bool build = kind == "build";
     Sources s = build ? await gatherNeeded(this.fs, this.cli, entry, this.cache)
@@ -75,6 +84,10 @@ export struct Engine {
     }
     string[] paths = exactly(s.paths, s.n);
     string[] texts = exactly(s.texts, s.n);
+    if (kind == "query") {
+      string answer = queryIn(paths, texts, resOf(s), entry, offset);
+      return Outcome("query", id, s.n, (this.core.nowMillis().wait() - t0) as! i32, answer.toBytes());
+    }
     if (!build) {
       string wire = diagnoseGraphIn(paths, texts, resOf(s), entry);
       return Outcome("check", id, s.n, (this.core.nowMillis().wait() - t0) as! i32, wire.toBytes());
@@ -198,6 +211,8 @@ export async i32 serve(Sys sys) {
       e.reset();
     } else if ((f[0] == "check" || f[0] == "build") && f.len() >= 3) {
       sys.cli.write(framed(await e.run(f[0], num(f[1]), f[2])));
+    } else if (f[0] == "query" && f.len() >= 4) {
+      sys.cli.write(framed(await e.run("query", num(f[1]), "\{f[2]}\t\{f[3]}")));
     }
   }
 }
@@ -209,8 +224,11 @@ export struct Checker {
   HostChild? kid;
   Engine? local;
   Cli cli;
+  Core core;
   Inbox in;
   i32 nextId;
+  /** A request is out: the next waits for its answer, since answers are read off one stream. */
+  bool busy;
   string note;
 
   /**
@@ -222,10 +240,10 @@ export struct Checker {
     string why = "a page opened from a file cannot start a process";
     if (spawn) {
       HostChild k = await cli.spawnSelf([("checker").toBytes()], GRANT_READ, "", 0, false).ticket();
-      if (k.handle >= 0) { return Checker(k, null, cli, Inbox.create(), 1, ""); }
+      if (k.handle >= 0) { return Checker(k, null, cli, core, Inbox.create(), 1, false, ""); }
       why = k.error;
     }
-    return Checker(null, Engine.create(fs, cli, core), cli, Inbox.create(), 1,
+    return Checker(null, Engine.create(fs, cli, core), cli, core, Inbox.create(), 1, false,
                    "Checking runs in the page here (\{why}), so typing may pause while it does.");
   }
 
@@ -245,8 +263,19 @@ export struct Checker {
     this.cli.send(this.kid!.handle, "reset\n".toBytes());
   }
 
-  /** Check — or with `kind` "build", compile — `entry`. One at a time: the caller waits for each. */
+  /**
+   * Check — or with `kind` "build", compile — `entry`; or with `kind` "query", ask what is at
+   * `file\toffset`. One at a time: the caller waits for each.
+   */
   async Outcome run(this, string kind, string entry) {
+    while (this.busy) { await this.core.sleepMillis(15).ticket(); }
+    this.busy = true;
+    Outcome o = await this.exchange(kind, entry);
+    this.busy = false;
+    return o;
+  }
+
+  async Outcome exchange(this, string kind, string entry) {
     i32 id = this.nextId;
     this.nextId++;
     if (this.local is not null) { return await this.local!.run(kind, id, entry); }

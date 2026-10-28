@@ -14,7 +14,8 @@ import { ElementEvent, MOD_CTRL, MOD_META, Node, Page, Picked, Ref, Ui, html.b, 
 import { Fs } from "../vendor/wac/packages/fs/src/fs.wac";
 import { Checker, Outcome, serve } from "./checker.wac";
 import { Diag, errorCount, inFile, parseWire } from "./diag.wac";
-import { Doc, Editor, dirty, newDoc, retext } from "./editor.wac";
+import { Doc, Editor, dirty, lineAt, newDoc, offsetOf, retext, u16Of } from "./editor.wac";
+import { Info, parseInfo } from "./info.wac";
 import { Entry, Incoming, Unpacked, PROJECTS, commonTop, ignored, join, leafOf, list, lowerOf, parentOf, projectName,
          projects, read, remove, rootOf, store, unpack, walk, write } from "./store.wac";
 import { css, icon } from "./style.wac";
@@ -60,6 +61,12 @@ struct App {
   bool naming;
   /** Bumped to put the caret in the editor in front. */
   i32 focusSeq;
+  /** What is known about the name at the caret, for the card under it; and the caret, which moved last. */
+  Info? info;
+  i32 infoSeq;
+  i32 caretSeq;
+  i32 caretByte;
+  string caretAt;
   string importing;
   string note;
   string error;
@@ -69,7 +76,7 @@ struct App {
 
 App newApp(Fs fs, bool persistent) {
   return App(fs, persistent, null, "", string[](), Map.create(hashString, stringEq), Map.create(hashString, stringEq), "",
-             Vec.create(), -1, Diag[](), 0, "", "", false, false, true, 0, false, "", 0, string[](), false, 0, "", "", "", "", "");
+             Vec.create(), -1, Diag[](), 0, "", "", false, false, true, 0, false, "", 0, string[](), false, 0, null, 0, 0, 0, "", "", "", "", "", "");
 }
 
 Doc? activeDoc(App a) { return a.active >= 0 && a.active < a.docs.len() ? a.docs.get(a.active) : null; }
@@ -395,6 +402,71 @@ async void build(Page page, App a, fn<void()> bump) {
   bump();
 }
 
+// ── what a name is, and where ───────────────────────────────────────────────
+
+/** The caret came to rest at byte `at` of the file in front: say where, and ask what is there soon. */
+void caretMoved(App a, i32 at, fn<void()> bump) {
+  Doc? d = activeDoc(a);
+  if (d is null) { return; }
+  i32 line = lineAt(d!, at);
+  a.caretAt = "Ln \{line}, Col \{u16Of(d!.text.slice(d!.starts[line - 1], at), at - d!.starts[line - 1]) + 1}";
+  a.caretByte = at;
+  if ((a.info is not null) && (a.info!.path != d!.path || at < a.info!.start || at > a.info!.end)) { a.info = null; a.infoSeq++; }
+  a.caretSeq++;
+  bump();
+}
+
+bool nameByte(u8 c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+
+/** Whether byte `at` of `text` is in or just after a name — the only places worth asking about. */
+bool onName(string text, i32 at) {
+  u8[] b = text.toBytes();
+  return (at < b.len() && nameByte(b[at])) || (at > 0 && at <= b.len() && nameByte(b[at - 1]));
+}
+
+/** What the checker says is at byte `at` of `d` — after it has been sent what is on screen. */
+async Info? askAbout(App a, Doc d, i32 at, fn<void()> bump) {
+  if (a.check is null || !isWac(d.path) || !onName(d.text, at)) { return null; }
+  if (dirty(d)) { await flush(a, bump); }
+  Outcome o = await a.check!.run("query", "\{d.path}\t\{at}");
+  if (o.kind != "query") { return null; }
+  return parseInfo(d.path, string.fromBytes(o.bytes));
+}
+
+async void showInfo(App a, fn<void()> bump) {
+  Doc? d = activeDoc(a);
+  if (d is null) { return; }
+  i32 at = a.caretByte;
+  i32 seq = a.caretSeq;
+  Info? i = await askAbout(a, d!, at, bump);
+  // Only if the caret is still where it was asked about.
+  if (seq != a.caretSeq || i is null || (i!.type == "" && i!.defPath == "")) { return; }
+  a.info = i;
+  a.infoSeq++;
+  bump();
+}
+
+/** Go to where the name at byte `at` of the file in front is declared. */
+async void goToDefinition(App a, i32 at, fn<void()> bump) {
+  Doc? d = activeDoc(a);
+  if (d is null) { return; }
+  Info? i = await askAbout(a, d!, at, bump);
+  if (i is null || i!.defPath == "") { a.note = "Nothing to go to here"; bump(); return; }
+  Info info = i!;
+  if (info.defPath == "core" || info.defPath == "std") {
+    // Built into the compiler, so not a file of this project: what it says is shown instead.
+    a.info = info;
+    a.infoSeq++;
+    a.note = "Declared in \{info.defPath}, which is built into wac";
+    bump();
+    return;
+  }
+  await jumpTo(a, info.defPath, info.defLine, info.defCol, bump);
+  a.info = null;
+  a.infoSeq++;
+  bump();
+}
+
 // ── the finder ──────────────────────────────────────────────────────────────
 
 /** How well `path` matches `q`, its letters in order: higher is better, -1 is no match. */
@@ -508,7 +580,7 @@ Node problemsPanel(App a, fn<void()> bump) {
       rows.push(<div class="pfile">{icon(isWac(g.file) ? "wac" : "file", "sm")}{leafOf(g.file)}<span class="where">{parentOf(rel(a, g.file))}</span></div>);
     }
     rows.push(<div class={g.warning ? "prow warn" : "prow err"} key={"p\{i}"}
-                   onclick={(ElementEvent e) => { jumpTo(a, g.file, g.line, bump); }}>
+                   onclick={(ElementEvent e) => { jumpTo(a, g.file, g.line, g.col, bump); }}>
       {icon(g.warning ? "warn" : "alert", "sm")}<span>{g.message}</span>
       {g.note != "" ? <span class="note">{g.note}</span> : Node.Text("")}
       <span class="pos">{"\{g.line}:\{g.col}"}</span></div>);
@@ -523,11 +595,14 @@ Node problemsPanel(App a, fn<void()> bump) {
   </div>;
 }
 
-async void jumpTo(App a, string path, i32 line, fn<void()> bump) {
+/** Open `path` with `line`, `col` in view and the caret on it. */
+async void jumpTo(App a, string path, i32 line, i32 col, fn<void()> bump) {
   await openFile(a, path, bump);
   Doc? d = activeDoc(a);
-  if (d is null) { return; }
+  if (d is null || d!.path != path) { return; }
+  while (!d!.loaded && a.check is not null) { await a.check!.core.sleepMillis(20).ticket(); }
   d!.jumpLine = line;
+  d!.jumpByte = offsetOf(d!, line, col);
   d!.jumpSeq++;
   bump();
 }
@@ -545,6 +620,13 @@ Node statusPill(App a, fn<void()> bump) {
 }
 
 Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
+  fn<void()> onEdit = () => {
+    a.editSeq++;
+    if (a.info is not null) { a.info = null; a.infoSeq++; }
+    bump();
+  };
+  fn<void(i32)> onCaret = (i32 at) => { caretMoved(a, at, bump); };
+  fn<void(i32)> onDefinition = (i32 at) => { goToDefinition(a, at, bump); };
   // How many errors each file has, for the tree.
   Map<string, i32> errs = Map.create(hashString, stringEq);
   for (i32 i = 0; i < a.diags.len(); i++) {
@@ -568,7 +650,9 @@ Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
     Diag[] mine = inFile(a.diags, d.path);
     editors[i] = <div class={i == a.active ? "slot" : "slot hidden"} key={d.path} style="height:100%">
       <Editor doc={d} version={d.version} diags={mine} diagKey={"\{a.diagSeq}"} jumpSeq={d.jumpSeq}
-              focusSeq={i == a.active ? a.focusSeq : 0} onEdit={() => { a.editSeq++; bump(); }}/></div>;
+              focusSeq={i == a.active ? a.focusSeq : 0} info={i == a.active ? a.info : null}
+              infoKey={i == a.active ? "\{a.infoSeq}" : ""}
+              onEdit={onEdit} onCaret={onCaret} onDefinition={onDefinition}/></div>;
   }
   Doc? d = activeDoc(a);
   return <>
@@ -604,6 +688,7 @@ Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
     </div>
     {a.problems ? problemsPanel(a, bump) : <div></div>}
     <div class="bar">
+      {a.caretAt != "" && (d is not null) ? <span>{a.caretAt}</span> : Node.Text("")}
       <span>{a.checkSummary}</span>
       {a.checkerNote != "" ? <span class="warnnote">{a.checkerNote}</span> : Node.Text("")}
       <span class="spacer"></span>
@@ -673,6 +758,11 @@ Node Ide(Ui ui, Page page) {
     begin(page, a, bump, () => { ready.set(true); });
     return () => { };
   });
+  // What the name at the caret is, once the caret has rested there a moment.
+  ui.effect("\{a.caretSeq}", () => {
+    if (a.caretSeq == 0) { return () => { }; }
+    return ui.after(450, () => { showInfo(a, bump); });
+  });
   // Edits reach the checker and the disk once typing pauses.
   ui.effect("\{a.editSeq}", () => {
     if (a.editSeq == 0) { return () => { }; }
@@ -694,6 +784,7 @@ Node Ide(Ui ui, Page page) {
                 if (cmd && (e.value == "p" || e.value == "P") && a.project != "") { a.finding = true; a.query = ""; a.hit = 0; bump(); }
                 else if (cmd && (e.value == "s" || e.value == "S")) { flush(a, bump); }
                 else if (e.value == "Escape" && a.finding) { a.finding = false; bump(); }
+                else if (e.value == "Escape" && a.info is not null) { a.info = null; a.infoSeq++; bump(); }
               }}>
     <style>{css()}</style>
     {!ready.get() ? <div class="home"><div class="progress">{icon("spin", "sm spin")}Starting…</div></div>
