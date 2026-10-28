@@ -1,0 +1,488 @@
+// What each error code says, in English.
+//
+// This is the first thing in the package to *consume* a code rather than count one, and writing it
+// found two things immediately. The codes were not unique — four of them named two different errors
+// each, which no position-comparing oracle could ever have noticed. And `report` carries a code and a
+// position and nothing else, so none of these messages can say `expected i32, found f64`: the
+// operands are not there to say it with. spec/spec/errors.md wants `annotation` and `hint` fields
+// too, and those need a diagnostic that carries its operands, which is the next thing to build.
+//
+// So what follows is the rule that was broken, phrased as the reference phrases it where the spec
+// quotes the wording, and plainly where it does not. It is deliberately the *rule* and never a guess
+// at the values involved — a message that invents `expected i32` when it does not know is worse than
+// one that omits it.
+
+/**
+ * The lex-phase codes — `err*` in `lex.wac`, and a third space again: 1–7, which is why the phase
+ * column has to say which space a number came from.
+ */
+export string lexMessage(i32 code) {
+  if (code == 1) { return "unexpected character"; }
+  // **"literal", because three other places say so.** spec/spec/errors.md's
+  // `§wac-diag-lex-unterm-str-m9fk2wq` block shows `unterminated string literal`, compiler/wacLex.ts
+  // pushes that string, and packages/wacc/test/specCases.json records it as the case's expected
+  // message. This said "unterminated string" until 2026-08-18 and nothing caught it: the differentials
+  // compare lex and parse errors by *position*, not by text.
+  if (code == 2) { return "unterminated string literal"; }
+  if (code == 3) { return "unknown escape"; }
+  if (code == 4) { return "unterminated block comment"; }
+  if (code == 5) { return "unterminated character literal"; }
+  if (code == 6) { return "empty character literal"; }
+  if (code == 7) { return "character literal holds more than one character"; }
+  // **The rule is in the message because a lexer diagnostic gets no `= help:` line.** `hintFor` is
+  // reached only for checker codes — `api.wac` calls it on `terrs` — and its table is keyed by the
+  // code alone, so a hint added for 8 here would attach to the *checker's* 8. The four ways to get
+  // this wrong are one sentence, so one sentence carries them. `design/lang/0013` D2.
+  if (code == 8) {
+    return "not a Unicode escape: `\\u{H...H}` takes 1-6 hex digits, at most 10FFFF, not a surrogate";
+  }
+  // **Named by what it is rather than by its category letter.** "category Cf" is the accurate
+  // answer and useless: a reader looking at a literal that appears to hold nothing wrong needs to be
+  // told the character is invisible, not what Unicode files it under. `design/lang/0013` D3.
+  if (code == 9) {
+    return "a literal cannot hold this character raw — it is a control or an invisible format "
+         + "character; write it as `\\u{...}`";
+  }
+  if (code == 10) {
+    return "a block string opens with `\"\"\"` and a newline — the content starts on the next line";
+  }
+  if (code == 11) {
+    return "a block string does not interpolate — `\\{` opens an expression only in a one-line literal";
+  }
+  if (code == 12) { return "a verbatim name is `@\"text\"`, with some text and on one line"; }
+  if (code == 13) { return "`\\{` opens an expression, and there is none before its `}`"; }
+  if (code == 14) { return "a hex literal is `0x` and at least one hex digit"; }
+  return "the lexer refused this";
+}
+
+/** The parse-phase codes, which are a separate space from the checker's — `perr*` in `parse.wac`. */
+export string parseMessage(i32 code) {
+  if (code == 20) { return "unexpected token"; }
+  if (code == 21) { return "expected a type"; }
+  if (code == 22) { return "expected an expression"; }
+  if (code == 23) { return "this cannot be assigned to"; }
+  if (code == 24) { return "this cannot appear at the top level of a file"; }
+  if (code == 25) { return "expected a field name"; }
+  if (code == 26) { return "expected a method name"; }
+  if (code == 27) { return "expected a brace after the struct name"; }
+  if (code == 28) { return "a function type cannot be used as an array element type"; }
+  if (code == 29) { return "a module specifier must be a quoted path"; }
+  if (code == 30) { return "a keyword cannot be used as a name"; }
+  if (code == 31) { return "'override' is not allowed on an enum method"; }
+  if (code == 32) { return "an enum method must take 'this'"; }
+  if (code == 34) { return "this string cannot interpolate"; }
+  if (code == 35) { return "a function type is written fn<R(P)>"; }
+  if (code == 36) { return "a match arm is written without case"; }
+  if (code == 37) { return "the catch-all arm of a match is default"; }
+  if (code == 38) { return "a match arm in statement position is a block"; }
+  if (code == 39) { return "an array's length is not part of its type"; }
+  if (code == 40) { return "an array with elements is written [a, b]"; }
+  if (code == 41) { return "an array type's factories are filled and defaulted"; }
+  if (code == 42) { return "a module-level variable must be static"; }
+  if (code == 43) { return "a const local needs its value where it is declared"; }
+  if (code == 33) { return "type arguments, and a value cannot follow them — parenthesise to compare"; }
+  return "the parser refused this";
+}
+
+/** The check-phase codes — `err*` in `check.wac`. */
+/**
+ * What a warning says. Separate from `checkMessage` because the two are separate channels: a code
+ * that is not an error must not be reachable by asking the error table for it.
+ */
+export string warnMessage(i32 code) {
+  if (code == 200) { return "this is never null, so the test is always false"; }
+  if (code == 201) { return "these types share no ancestor, so the test is always false"; }
+  if (code == 202) { return "these types share no ancestor, so this cast always traps"; }
+  return "";
+}
+
+export string checkMessage(i32 code) {
+  if (code == 1) { return "return type does not match the function's"; }
+  if (code == 2) { return "not every path returns a value"; }
+  if (code == 3) { return "initialiser does not match the declared type"; }
+  if (code == 4) { return "operands have mismatched types"; }
+  if (code == 5) { return "argument does not match the parameter's type"; }
+  if (code == 6) { return "condition must be bool"; }
+  if (code == 7) { return "these types cannot be compared"; }
+  if (code == 8) { return "field does not match the declared type"; }
+  if (code == 9) { return "a nullable value cannot be assigned to a non-null type"; }
+  if (code == 10) { return "cannot assign to const variable"; }
+  if (code == 11) { return "cannot assign to a field of a const value"; }
+  if (code == 12) { return "cannot write through const reference"; }
+  if (code == 13) { return "no such static method"; }
+  if (code == 14) { return "no such method"; }
+  if (code == 15) { return "a non-const reference cannot be taken from a const one"; }
+  if (code == 16) { return "wrong cast operator for these types"; }
+  if (code == 17) { return "duplicate parameter name"; }
+  if (code == 18) { return "array element does not match the element type"; }
+  if (code == 19) { return "wrong number of arguments to a builtin"; }
+  if (code == 20) { return "argument of the wrong type to a builtin"; }
+  if (code == 21) { return "this method overrides one and does not say `override`"; }
+  if (code == 22) { return "this method says `override` and overrides nothing"; }
+  if (code == 23) { return "increment needs an integer"; }
+  if (code == 24) { return "`>>>` is redundant on an unsigned type"; }
+  if (code == 203) { return "this needs a nullable value"; }
+  if (code == 25) { return "wrong number of arguments to the constructor"; }
+  if (code == 27) { return "a string's characters cannot be written to"; }
+  if (code == 28) { return "this type has no default value"; }
+  if (code == 30) { return "this cast goes down the hierarchy and must be checked"; }
+  if (code == 31) { return "there is no loop here to break out of or continue"; }
+  if (code == 32) { return "wrong number of arguments"; }
+  if (code == 34) { return "this static needs its own value to be computed — a dependency cycle"; }
+  if (code == 35) { return "undefined name"; }
+  if (code == 36) { return "void cannot be used as a type here"; }
+  if (code == 37) { return "a return with a value in a void function, or without one where a value is wanted"; }
+  if (code == 38) { return "this operator does not take an operand of that kind"; }
+  if (code == 39) { return "no such field"; }
+  if (code == 40) { return "a nullable value must be unwrapped before it is used"; }
+  if (code == 41) { return "an index must be an integer"; }
+  if (code == 206) { return "only an array or a string can be indexed"; }
+  if (code == 207) { return "two cases of this switch have the same value"; }
+  if (code == 208) { return "the wrong number of type arguments"; }
+  // **Not "out of range", because it is in range.** `'é'` is 233 and a `u8` holds 0..255; what is
+  // wrong is that the two mean different things. `design/lang/0013`.
+  if (code == 209) { return "a character literal is a codepoint, and this element holds a byte"; }
+  if (code == 210) { return "the compiler's copy of that built-in does not export this name"; }
+  if (code == 211) { return "`await` outside an `async` function"; }
+  if (code == 212) { return "this cannot be awaited"; }
+  if (code == 213) { return "`async` on a lambda whose slot wants no ticket"; }
+  if (code == 214) { return "this array literal has no element type"; }
+  if (code == 215) { return "an array literal is not a value of this type"; }
+  if (code == 216) { return "a package is named whole"; }
+  if (code == 217) { return "a private member is visible only inside its type's body"; }
+  if (code == 218) { return "positional construction of a struct with private fields is for its own body"; }
+  if (code == 219) { return "a deferred statement runs on the way out and cannot leave its block"; }
+  if (code == 220) { return "this pattern can never match"; }
+  if (code == 221) { return "the pattern names a different number of payload fields than the variant has"; }
+  if (code == 222) { return "a name is exported once"; }
+  if (code == 223) { return "these literals have no type: nothing here gives them one, and there is no default"; }
+  if (code == 248) { return "a private method cannot be virtual"; }
+  if (code == 249) { return "this struct's parent has a private field with no default, so it cannot be constructed"; }
+  if (code == 250) { return "a case value must be a constant"; }
+  if (code == 251) { return "this loop drops the generator's outcome, and it can be an error"; }
+  if (code == 224) { return "a local is read where not every path has assigned it"; }
+  if (code == 225) { return "a lambda uses a local that is not yet assigned"; }
+  if (code == 226) { return "a never function cannot return"; }
+  if (code == 227) { return "this variant's payload has no value, so the variant cannot be constructed"; }
+  if (code == 228) { return "this operand can never be absent"; }
+  if (code == 229) { return "`for … in` walks an array or a Vec"; }
+  if (code == 230) { return "this value has no conversion to text"; }
+  if (code == 231) { return "this method has the name of a parent method that is not virtual"; }
+  if (code == 232) { return "a schedule target takes a Continuation and answers nothing"; }
+  if (code == 233) { return "`try` takes a Result"; }
+  if (code == 234) { return "`try` needs a function that returns a Result"; }
+  if (code == 235) { return "the error `try` passes on does not fit the function's error type"; }
+  if (code == 236) { return "this `yield` has no generator to yield from, or yields the wrong thing"; }
+  if (code == 238) { return "computing this static traps"; }
+  if (code == 239) { return "static evaluation stopped at a resource limit — the answer is unknown"; }
+  if (code == 240) { return "this static uses something the compiler cannot evaluate statically yet"; }
+  if (code == 241) { return "static_trap"; }
+  if (code == 242) { return "a static_if condition must be computable at compile time"; }
+  if (code == 243) { return "a static initialiser cannot read a runtime value"; }
+  if (code == 244) { return "this type reaches itself through aliases and nullable layers alone"; }
+  if (code == 245) { return "this local is used before it is declared"; }
+  if (code == 246) { return "this function's returns give its `auto` result no type — they share none, or one is a bare `return;`"; }
+  if (code == 247) { return "this markup has nothing to build it"; }
+  if (code == 237) { return "an async generator is iterated with `for await`, and only it"; }
+  if (code == 42) { return "the two branches of a ternary have unrelated types"; }
+  if (code == 43) { return "this operator needs a reference"; }
+  if (code == 44) { return "a switch subject must be an i32 or a u32"; }
+  // Both halves, because the code carries both: a name the struct does not have, and a field left
+  // out. The headline said only the first, so a construction missing `y` was reported as though `y`
+  // were misspelled — and a component, which is a named construction with a tag for a name, said it
+  // about an attribute the reader had not written at all.
+  if (code == 45) { return "a named construction names each field of the struct exactly once"; }
+  if (code == 46) { return "this cast is between one type and itself"; }
+  if (code == 47) { return "this is not something that can be called"; }
+  if (code == 48) { return "a method is not a value; call it or take it as a funcref"; }
+  if (code == 49) { return "a type name is not a value"; }
+  // **Both kinds of literal, so the headline names the rule and not one caller.** `reportLiteral`
+  // raises this for an integer too wide for its slot as well as a float too large for an `f32`, and
+  // saying *float* meant `i32 b = 5000000000;` was reported as a float literal — which is the one
+  // thing the reader can see is not true. The annotation carries which type it did not fit.
+  if (code == 50) { return "literal out of range for its type"; }
+  if (code == 51) { return "no variant of that name"; }
+  if (code == 52) { return "unknown module"; }
+  if (code == 53) { return "a generic that instantiates itself for ever"; }
+  if (code == 54) { return "an enum method cannot be named after one of its variants"; }
+  if (code == 55) { return "this name is already imported or declared in this file"; }
+  if (code == 77) { return "no file was supplied at that path"; }
+  if (code == 78) { return "cannot tell what a type parameter is here"; }
+  if (code == 79) { return "the arguments imply two different types for one type parameter"; }
+  if (code == 56) { return "that file does not export this name"; }
+  if (code == 57) { return "undefined type"; }
+  if (code == 58) { return "match does not cover every variant"; }
+  if (code == 59) { return "duplicate arm for the same variant"; }
+  if (code == 204) { return "a match has more than one default arm"; }
+  if (code == 205) { return "this arm binds the same name twice"; }
+  if (code == 60) { return "default arm is unreachable — all variants are covered"; }
+  if (code == 61) { return "binding collides with the matched subject"; }
+  if (code == 62) { return "match requires a non-null value"; }
+  if (code == 63) { return "match arms have incompatible types"; }
+  if (code == 64) { return "duplicate name at file scope"; }
+  if (code == 65) { return "duplicate member in this struct"; }
+  if (code == 66) { return "a character literal must hold exactly one character"; }
+  if (code == 67) { return "a switch cannot have two defaults"; }
+  if (code == 68) { return "this closing tag names a different element"; }
+  if (code == 69) { return "this attribute is written twice"; }
+  if (code == 70) { return "this tag cannot be called"; }
+  if (code == 71) { return "which instantiation of this generic enum is not known here"; }
+  if (code == 72) { return "match requires an enum value"; }
+  if (code == 73) { return "nothing here wants a function, so this lambda has no type"; }
+  if (code == 74) { return "this lambda's parameters do not match the function type wanted"; }
+  if (code == 75) { return "a method with its own type parameters cannot be called yet"; }
+  if (code == 76) { return "this arm binds a different number of names than the variant has"; }
+  return "this program was refused";
+}
+
+/**
+ * The `= help:` line, where a rule has advice worth giving.
+ *
+ * Different in kind from the annotation: the annotation is data from the site — the values this
+ * particular program used — and this is advice about the *rule*, which is the same every time it is
+ * broken. So it lives here and needs nothing from the hundred-odd call sites, which is why it costs
+ * a table rather than a sweep.
+ *
+ * Empty for most codes on purpose. A hint that restates the message is noise, and the reader has
+ * already read the message.
+ */
+export string hintFor(i32 code) {
+  if (code == 230) { return "give its type a `[toString]` method, or convert it before interpolating"; }
+  if (code == 231) { return "mark the parent's method `virtual` and this one `override`, or give it another name"; }
+  if (code == 232) { return "pass a `fn<void(Continuation)>` — `schedule pending.push;` for a `Vec<Continuation>`"; }
+  if (code == 233) { return "`try` passes an `Err` on; for a nullable, `!` or `??` is what you want"; }
+  if (code == 234) { return "declare the function to answer `Result<…>`, or take the value apart with `match`"; }
+  if (code == 235) { return "make the function's error type the one this fails with, or `match` the error here"; }
+  if (code == 236) { return "declare the function `gen<Y> R`, or `async gen<Y> R` to wait as well"; }
+  if (code == 237) { return "write `for await (…)` in an `async` function, or step it by hand"; }
+  if (code == 247) { return "the tree builds its own markup: give it the static `[markup.…]` method this needs, or write a value of its type"; }
+  if (code == 229) { return "index it with a counting `for`, or put the elements in an array or a Vec"; }
+  if (code == 228) { return "`?.` and `??` are for a value that may be absent — read this one directly"; }
+  if (code == 1) { return "use a cast if the conversion is meant: `as!` is checked, `as~` takes the nearest value"; }
+  if (code == 2) { return "add a return at the end, or make every branch return"; }
+  if (code == 3) { return "use `as!` for a checked conversion or `as~` for the nearest value"; }
+  if (code == 6) { return "use a comparison, such as `x != 0`"; }
+  if (code == 9) { return "unwrap it with `!` once you have checked it is not null"; }
+  if (code == 10) { return "drop the `const`, or bind a separate local for the value that changes"; }
+  if (code == 12) { return "take the parameter without `const` if it is meant to be written through"; }
+  if (code == 16) { return "`as` converts without loss, `as!` checks at runtime, `as~` takes the nearest value"; }
+  // The distinction the rule turns on, because "instantiates itself for ever" is a symptom and
+  // this is the cause: recursion on the *same* type parameter is the commonest shape there is.
+  if (code == 53) { return "a recursive generic must pass `T` along, not something that contains it"; }
+  if (code == 30) { return "use `as!` — a cast down the hierarchy has to be checked"; }
+  // Not "test it with `is null` first": a test does not narrow a nullable (`issues/lang/0321a`), so a
+  // reader who followed that advice met the same refusal on the next line.
+  if (code == 40) { return "unwrap it with `!`, or give it a default with `??`"; }
+  if (code == 29) { return "quote it — `core` included, since D5 removed the one bare spelling"; }
+  if (code == 46) { return "the cast can be removed"; }
+  // Kept useful for the float case without asserting the literal is one — `i32 b = 5000000000;` was
+  // told to use an `f64`, which is advice about a different program.
+  if (code == 50) { return "a literal has to fit the type it is written for; `f64` holds what an `f32` cannot"; }
+  if (code == 55) { return "rename one of them with `as`"; }
+  if (code == 77) { return "supply the file, or check the path — `core` and `std` are the only trees that need none"; }
+  if (code == 78) { return "the arguments are what say it — a `null` is a value of no type, so it says nothing"; }
+  if (code == 79) { return "one type parameter is one type — convert one argument, or give the function two"; }
+  if (code == 56) { return "import it from the file that declares it — importing does not re-export"; }
+  if (code == 57) { return "import the type, or check the spelling"; }
+  if (code == 58) { return "add the missing arms, or a `default`"; }
+  if (code == 60) { return "remove the `default` — every variant is already covered"; }
+  if (code == 62) { return "unwrap the subject with `!`, or give it a default with `??`"; }
+  if (code == 209) { return "compare against the bytes — `\"é\".toBytes()` is 195 169, not 233"; }
+  if (code == 210) { return "`core/` and `std/` are carried inside the compiler — run `wac task gen:core` if you have edited one"; }
+  if (code == 211) { return "declare the function `async`, or `.wait()` the ticket — which blocks"; }
+  if (code == 212) { return "`await` takes a `Ticket<T>` — what an `async` call and every capability hand back"; }
+  if (code == 213) { return "an `async` lambda goes where a `fn<Ticket<R>(…)>` is wanted, and its body answers `R`"; }
+  if (code == 214) { return "give it one: a typed slot, a typed element, or `[…] as T[]`"; }
+  if (code == 216) { return "import from `\"core\"` or `\"std\"` — everything a package exports is at its root"; }
+  if (code == 217) { return "reach it through one of the type's own methods"; }
+  if (code == 218) { return "name the fields — `S { a: 1 }` — or call one of the struct's own static methods"; }
+  if (code == 219) { return "no `return` or `defer` in it, and `break` or `continue` only inside a loop of its own"; }
+  if (code == 223) { return "give one of them a type — `1 as i64 == x` — or compare a typed value"; }
+  if (code == 248) { return "drop `private` to let a subtype override it, or `virtual` to keep it to this body"; }
+  if (code == 249) { return "give the private field a default, or make it not private"; }
+  if (code == 250) { return "compare a run-time value with `if`, or make it a `static`"; }
+  if (code == 251) { return "bind it after the loop with `done (R r) { … }`, or pass an error on with `try for`"; }
+  if (code == 224) { return "assign it on every path that reaches here, or initialise it where it is declared"; }
+  if (code == 225) { return "a lambda can run at any time, so make it after the local is assigned"; }
+  // Added where the help is real. A hint that only restates the message is worse than none: it
+  // costs a line of everybody's terminal and teaches nothing, and the percentage it moves is a
+  // measurement of itself.
+  if (code == 4) { return "cast one side, or change what the other was declared as"; }
+  if (code == 13) { return "a static is called on the type — check the spelling, or call it on a value"; }
+  if (code == 15) { return "take a copy, or declare the destination `const` too"; }
+  if (code == 19) { return "check the builtin's parameters — they are fixed"; }
+  if (code == 20) { return "check the builtin's parameters — they are fixed"; }
+  if (code == 24) { return "`>>` on an unsigned type is already a logical shift — write `>>`"; }
+  if (code == 203) { return "a `T?`, which is what there is something to unwrap from"; }
+  if (code == 32) { return "check the declaration for how many it takes"; }
+  if (code == 34) { return "build it from literals, or move it into a function"; }
+  if (code == 38) { return "check what the operand is — the operator wants another kind"; }
+  if (code == 64) { return "rename one of them"; }
+  if (code == 65) { return "rename one of them"; }
+  // A second round, chosen the same way: each of these says something the message does not, and the
+  // ones that would only have restated it were left alone. Counted over the spec's refused corpus
+  // rather than guessed at — `waccx.test.ts` reports the percentage and holds a floor under it.
+  if (code == 22) { return "check the parent declares it, with the same parameters"; }
+  if (code == 28) { return "give one: `T[].filled(n, v)` — a reference has no zero to start from"; }
+  if (code == 31) { return "a `break` inside a `switch` leaves the switch, and there is no loop here"; }
+  if (code == 47) { return "only a function, a funcref or a method is callable"; }
+  return "";
+}
+
+/**
+ * Help for a *parse* diagnostic, where there is any.
+ *
+ * Only two of these have anything to say. "unexpected token" is the parser's way of saying it has
+ * no idea, and a hint under it would be filler — which is why the numbers this moves are smaller
+ * than the count of parse diagnostics suggests they could be.
+ */
+export string parseHintFor(i32 code) {
+  if (code == 21) { return "a type is a name like `i32`, `string`, or one this file declares"; }
+  if (code == 35) { return "angle brackets, the return type first: `fn<i32(i32)>`"; }
+  if (code == 36) { return "the pattern alone: `Some(v): …`"; }
+  if (code == 37) { return "write `default:`"; }
+  if (code == 38) { return "put the arm's statements in braces: `Some(v): { … }`"; }
+  if (code == 39) { return "write `T[].filled(n, value)`, or `T[].defaulted(n)` where `T` has a default"; }
+  if (code == 40) { return "the elements in brackets, `[a, b]` — or `[a, b] as T[]` to give them a type"; }
+  if (code == 41) { return "`T[].filled(n, value)` or `T[].defaulted(n)`"; }
+  if (code == 42) { return "write `static`: its initialiser runs at compile time, and there is no mutable module state"; }
+  if (code == 25) { return "a field is `type name;` — the name comes after the type"; }
+  // No hint for 30: the annotation already names the keyword and the position, and this file's rule
+  // is that a hint with nothing to add is filler.
+  if (code == 31) { return "an enum's variants are the compiler's own subtypes, so there is nothing to override"; }
+  if (code == 32) { return "`E.name()` is already how a variant is constructed, so a static method would be ambiguous"; }
+  return "";
+}
+
+// ── Spelling a type for a reader ─────────────────────────────────────────────────────────────────
+
+/**
+ * `s` with every function type in it spelled the way a program writes one: `fn<R(A, B)>`.
+ *
+ * The checker keys a function type as `fn(A, B) -> R` and the emitter and the manifest wire as
+ * `fn<R(A, B)>`. Both are this compiler's own notation and neither is wac, so a diagnostic or a report
+ * that showed either would be teaching a reader a syntax the language refuses. Everything leaving the
+ * compiler for a person goes through here; the internal keys are left as they are.
+ */
+export string displayTypes(string s) {
+  return checkerFnTypes(wireFnTypes(s));
+}
+
+/** `fn<R(A)>` → `fn<R(A)>`, matching brackets so a nested or array-typed parameter survives. */
+string wireFnTypes(string s) {
+  if (s.indexOf("fn[") < 0) { return s; }
+  string out = "";
+  bool[] isFn = bool[].filled(s.len() + 1, false);
+  i32 depth = 0;
+  i32 i = 0;
+  while (i < s.len()) {
+    if (i + 3 <= s.len() && s.slice(i, i + 3) == "fn[" && (i == 0 || !wordByte(s.slice(i - 1, i)))) {
+      out = out + "fn<";
+      isFn[depth] = true;
+      depth = depth + 1;
+      i = i + 3;
+      continue;
+    }
+    string c = s.slice(i, i + 1);
+    if (c == "[") {
+      isFn[depth] = false;
+      depth = depth + 1;
+      out = out + c;
+    } else if (c == "]" && depth > 0) {
+      depth = depth - 1;
+      out = out + (isFn[depth] ? ">" : "]");
+    } else {
+      out = out + c;
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+/** `fn(A, B) -> R` → `fn<R(A, B)>`, recursing into both halves. */
+string checkerFnTypes(string s) {
+  if (s.indexOf("fn(") < 0) { return s; }
+  string out = "";
+  i32 i = 0;
+  while (i < s.len()) {
+    // `(fn(A) -> R)?` is the checker's nullable funcref — bracketed there so `?` cannot be read as
+    // part of `R` — and `fn<R(A)>?` in the spelling a reader writes, where the brackets do that job.
+    if (i + 4 <= s.len() && s.slice(i, i + 4) == "(fn(") {
+      i32 shut = matchingParen(s, i);
+      if (shut > 0 && shut + 1 < s.len() && (s.slice(shut + 1, shut + 2) == "?" || s.slice(shut + 1, shut + 2) == "[")) {
+        out = out + checkerFnTypes(s.slice(i + 1, shut));
+        i = shut + 1;
+        continue;
+      }
+    }
+    if (i + 3 <= s.len() && s.slice(i, i + 3) == "fn(" && (i == 0 || !wordByte(s.slice(i - 1, i)))) {
+      i32 close = matchingParen(s, i + 2);
+      if (close > 0 && close + 5 <= s.len() && s.slice(close + 1, close + 5) == " -> ") {
+        i32 retEnd = typeEnd(s, close + 5);
+        string params = s.slice(i + 3, close);
+        string ret = s.slice(close + 5, retEnd);
+        out = out + "fn<" + checkerFnTypes(ret) + "(" + checkerFnTypes(params) + ")>";
+        i = retEnd;
+        continue;
+      }
+    }
+    out = out + s.slice(i, i + 1);
+    i = i + 1;
+  }
+  return out;
+}
+
+/** The index of the `)` closing the `(` at `open`, or -1. */
+i32 matchingParen(string s, i32 open) {
+  i32 depth = 0;
+  for (i32 i = open; i < s.len(); i++) {
+    string c = s.slice(i, i + 1);
+    if (c == "(") { depth = depth + 1; }
+    else if (c == ")") {
+      depth = depth - 1;
+      if (depth == 0) { return i; }
+    }
+  }
+  return -1;
+}
+
+/** Where the type starting at `k` ends: a function type, or a name with its arguments and suffixes. */
+i32 typeEnd(string s, i32 k) {
+  // `const T` is one type with a space in it: a funcref answering `const App` printed as
+  // `fn<const(…)> App` when the end was the first space.
+  if (k + 6 <= s.len() && s.slice(k, k + 6) == "const ") { return typeEnd(s, k + 6); }
+  if (k + 3 <= s.len() && s.slice(k, k + 3) == "fn(") {
+    i32 close = matchingParen(s, k + 2);
+    if (close < 0) { return s.len(); }
+    if (close + 5 <= s.len() && s.slice(close + 1, close + 5) == " -> ") { return typeEnd(s, close + 5); }
+    return close + 1;
+  }
+  i32 i = k;
+  if (k + 4 <= s.len() && s.slice(k, k + 4) == "(fn(") {
+    i32 shut = matchingParen(s, k);
+    i = shut < 0 ? s.len() : shut + 1;
+  }
+  while (i < s.len() && (wordByte(s.slice(i, i + 1)) || s.slice(i, i + 1) == ".")) { i = i + 1; }
+  if (i < s.len() && s.slice(i, i + 1) == "<") {
+    i32 depth = 0;
+    while (i < s.len()) {
+      string c = s.slice(i, i + 1);
+      if (c == "<") { depth = depth + 1; }
+      if (c == ">") {
+        depth = depth - 1;
+        if (depth == 0) { i = i + 1; break; }
+      }
+      i = i + 1;
+    }
+  }
+  while (i < s.len()) {
+    if (s.slice(i, i + 1) == "?") { i = i + 1; continue; }
+    if (i + 2 <= s.len() && s.slice(i, i + 2) == "[]") { i = i + 2; continue; }
+    break;
+  }
+  return i;
+}
+
+bool wordByte(string c) {
+  return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_";
+}

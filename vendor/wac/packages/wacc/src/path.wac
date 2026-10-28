@@ -1,0 +1,303 @@
+// One path rule, in a module that imports nothing.
+//
+// `resolveFrom` and `normalisePath` lived in `files.wac`, and `emit.wac`'s linker could not call
+// them: `files.wac` imports `stringLiteralBytes` **from** `emit.wac`, so the edge back would be a
+// cycle. So the linker had its own copy, `resolveImport`, and the two disagreed —
+// `./sub/../lib.wac` was read as `lib.wac` by the walker and asked for as `sub/../lib.wac` by the
+// linker, which is `issues/lang/0150`: a valid program that reads and then does not link.
+//
+// A module with no imports is what breaks the cycle rather than the rule. Nothing here needs a
+// lexer, a parser or an emitter — it is string arithmetic over paths — so both ends can have it.
+//
+// **There were seven copies** across `files.wac`, `emit.wac`, compiler/wacResolve.ts,
+// `harness/wacFiles.ts`, the reference CLI's (since retired), `packages/wacc/test/corpus.ts` and
+// `site/src/editor/file-store.ts`. This removes the one that was reachably wrong; the rest are
+// 0150's remaining work, and `design/lang/0009` is why it matters — a manifest lookup, a provider
+// table and a mapping table are not two lines, and seven copies of *those* will not agree.
+//
+// **Two, as of 2026-08-19: this one and compiler/wacResolve.ts.** The reference CLI's went with
+// the CLI, `corpus.ts`'s became the harness's, the harness's became a call into the compiler's, and
+// `site/src/editor/file-store.ts`'s was deleted — it was exported and nothing called it, because the
+// editor hands `wacCompile` the whole file map and lets the compiler resolve. Two is the floor:
+// there are two languages. Consolidating found the last disagreement between them rather than
+// merely tidying, so it is worth naming — `..` above an absolute root, where the compiler's answer
+// dropped the leading slash and produced a relative key, which is D8's failure in miniature.
+
+/**
+ * `spec` resolved against the directory `fromPath` sits in, with `.` and `..` collapsed.
+ *
+ * Collapsing matters for identity rather than for tidiness: the same file reached two ways would
+ * otherwise be two entries in `paths`, and every type it declares would exist twice. An absolute
+ * path keeps its leading slash — normalising that away turns it into a relative one, and the read
+ * then fails somewhere far from the cause.
+ */
+import { isBuiltinSpec } from "./coretext.wac";
+
+export string resolveFrom(string fromPath, string spec) {
+  return resolveFromIn(fromPath, spec, "");
+}
+
+/** Whether `spec` is a project reference — `design/lang/0009` D7. */
+export bool isProjectSpec(string spec) {
+  return spec.len() >= 2 && spec.slice(0, 2) == "@/";
+}
+
+/**
+ * `spec` resolved for a file whose project root is `root`.
+ *
+ * **The root is a parameter because it cannot be looked up from here.** D7 makes `@/` the root of
+ * the project containing the *importing file*, found by searching upwards for a `wac.json5` — which
+ * is I/O, and this module opens nothing. So the caller that already reads files finds it and passes
+ * it; a graph spanning two projects has two roots, which is why it is per file rather than per
+ * compilation.
+ *
+ * **`""` for a root means there is no project, and the answer is `""` rather than a guess.** D7 says
+ * that is a compile error, and the caller reports it. The alternative resolves and is worse:
+ * `@/src/a.wac` joined to nothing gives `src/a.wac`, a real-looking key relative to a directory
+ * nobody named, so a program would compile against the wrong file instead of being refused.
+ */
+/**
+ * `abs` written as a path relative to `base`, both absolute and normalised.
+ *
+ * **Why a `@/` needs this and an ordinary import does not.** Every key in a graph is relative to the
+ * directory the command was run in, because that is what the entry was relative to. A `@/` is the one
+ * specifier whose root is *discovered* rather than spelled, and the root can sit above that
+ * directory — so joining the root to the tail and stopping gives `../src/a.wac` for a file an
+ * ordinary import calls `src/a.wac`. Same file, two keys, which is `issues/lang/0163`'s failure.
+ * Resolving to an absolute path and expressing *that* against the base lands both on one key.
+ */
+export string relativeTo(string base, string abs) {
+  if (base == "" || base == abs) { return base == abs ? "." : abs; }
+  if (abs.len() > base.len() && abs.slice(0, base.len() + 1) == base + "/") {
+    return abs.slice(base.len() + 1, abs.len());
+  }
+  // Climb: how much of `base` is a prefix of `abs`, counted in whole components so that `/a/bc`
+  // does not read as inside `/a/b`.
+  i32 keep = 0;
+  i32 i = 0;
+  while (i < base.len() && i < abs.len() && base.slice(i, i + 1) == abs.slice(i, i + 1)) {
+    if (base.slice(i, i + 1) == "/") { keep = i; }
+    i = i + 1;
+  }
+  if (i == base.len() && i < abs.len() && abs.slice(i, i + 1) == "/") { keep = i; }
+  string up = "";
+  for (i32 k = keep; k < base.len(); k++) {
+    if (base.slice(k, k + 1) == "/") { up = up + "../"; }
+  }
+  string tail = keep + 1 <= abs.len() ? abs.slice(keep + 1, abs.len()) : "";
+  string joined = up + tail;
+  return joined == "" ? "." : normalisePath(joined);
+}
+
+/** `resolveFromIn` with the directory every relative key is measured from — see `relativeTo`. */
+export string resolveFromAt(string fromPath, string spec, string root, string base) {
+  if (isBuiltinSpec(spec)) { return spec; }
+  if (isProjectSpec(spec)) {
+    if (root == "") { return ""; }
+    string joined = normalisePath(root + "/" + spec.slice(2, spec.len()));
+    // **Back into the key space this file is already in, and only if that space is relative.**
+    //
+    // An absolute root means the search climbed past `base`, so the join is absolute and the rest
+    // of a relatively-keyed graph would not recognise it. But two kinds of file are *already*
+    // absolutely keyed and must stay that way: one reached through a mapping, which lives under its
+    // checkout, and one whose entry was given as an absolute path. Converting those to `../..`
+    // against the project's own directory gives a second key for a file that already had one — and
+    // for a mapped file it also walks the answer out of the checkout it is confined to. Both were
+    // caught by existing cases, `one_file_reached_two_ways_is_one_module` and the in-subdir half of
+    // `a_mapped_subdir_cannot_import_outside_itself`, which is what these two clauses are.
+    bool fromIsRelative = fromPath.len() == 0 || fromPath.slice(0, 1) != "/";
+    if (base != "" && fromIsRelative && root.len() > 0 && root.slice(0, 1) == "/") {
+      return relativeTo(base, joined);
+    }
+    return joined;
+  }
+  if (isBareSpecifier(spec)) { return ""; }
+  return resolveFromIn(fromPath, spec, root);
+}
+
+/**
+ * A specifier that is none of the three kinds the language defines — `issues/system/0234a`.
+ *
+ * spec/spec/imports.md: a path is relative (`./` or `../`), `@/` is the project root, and a bare
+ * name **may name a mapping** declared in the manifest. `[§wac-package-key-exact-rme93fh]` Nothing makes
+ * a bare name fall back to path arithmetic — but every caller did, joining it to the importing file's
+ * directory, which produces a file that is usually not there and *occasionally is*. That is the worse
+ * of the two failures: `dep/lib.wac` with a `src/dep/` directory compiled a file the manifest never
+ * named, exit 0, no diagnostic.
+ *
+ * **A mapping is resolved before this is reached**, by the caller that has a manifest to read — see
+ * the `isMappingCandidate` branch in `packages/wac/src/wac.wac` — so a bare specifier arriving here
+ * is one that named no mapping. The harness has no manifests at all, which is the same answer for a
+ * different reason.
+ *
+ * A leading `/` is absolute and not this: `resolveFromIn` answers it as itself. Joining it to the
+ * importing file's directory, as it did until 2026-10-20, spliced `src//abs/x.wac` into `src/abs/x.wac`.
+ */
+export bool isBareSpecifier(string spec) {
+  if (spec.len() == 0) { return false; }
+  string head = spec.slice(0, 1);
+  if (head == "." || head == "/") { return false; }
+  if (isProjectSpec(spec)) { return false; }
+  return !isBuiltinSpec(spec);
+}
+
+export string resolveFromIn(string fromPath, string spec, string root) {
+  // **A built-in is its own key, decided before any path arithmetic.** `core/result.wac` names a
+  // module inside the compiler, so joining it to the importing file's directory looks for
+  // packages/std/src/core/result.wac. Both callers get the reservation from here — `gather` in
+  // `example/wacc.wac`, which reads files, and `resolveImport` in `emit.wac`, which links them —
+  // because putting it in one and not the other is a module the graph reads and the linker cannot
+  // find. `design/lang/0009` D4.
+  if (isBuiltinSpec(spec)) { return spec; }
+  if (isProjectSpec(spec)) {
+    if (root == "") { return ""; }
+    return normalisePath(root + "/" + spec.slice(2, spec.len()));
+  }
+  if (isBareSpecifier(spec)) { return ""; }
+  if (spec.slice(0, 1) == "/") { return normalisePath(spec); }
+  i32 cut = -1;
+  for (i32 i = 0; i < fromPath.len(); i++) {
+    if (fromPath.slice(i, i + 1) == "/") { cut = i; }
+  }
+  string dir = cut < 0 ? "." : fromPath.slice(0, cut);
+  return normalisePath(dir + "/" + spec);
+}
+
+/**
+ * One path, with `.` and `..` collapsed — the spelling every key in a program map is in.
+ *
+ * **The entry needs this as much as an import does.** `resolveFrom` has always normalised what it
+ * builds, and the entry went into the map exactly as it was typed — so `wac test ./a/b.wac` keyed
+ * the entry `./a/b.wac` while its own imports resolved to `a/…`, and the compiler reported "an
+ * import of a file that was not supplied" about a file that was. `issues/lang/0134`.
+ *
+ * A leading `./` is the whole of what a shell's tab completion produces, so this was the spelling
+ * most likely to be typed and the one that did not work.
+ *
+ * An absolute path keeps its leading slash — normalising that away turns it into a relative one, and
+ * the read then fails somewhere far from the cause.
+ */
+export string normalisePath(string path) {
+  bool absolute = path.len() > 0 && path.slice(0, 1) == "/";
+  string joined = path;
+
+  // The parts that survive, as a stack: `.` drops, `..` pops what it can.
+  string[] parts = string[].filled(64, "");
+  i32 n = 0;
+  i32 start = 0;
+  for (i32 i = 0; i <= joined.len(); i++) {
+    bool end = i == joined.len();
+    if (!end && joined.slice(i, i + 1) != "/") { continue; }
+    string part = joined.slice(start, i);
+    start = i + 1;
+    if (part == "" || part == ".") { continue; }
+    if (part == ".." && n > 0 && parts[n - 1] != "..") { n = n - 1; continue; }
+    if (n >= parts.len()) { continue; }
+    parts[n] = part;
+    n = n + 1;
+  }
+  string out = "";
+  for (i32 i = 0; i < n; i++) { out = out + (i > 0 ? "/" : "") + parts[i]; }
+  return absolute ? "/" + out : out;
+}
+
+/**
+ * What the reader worked out about a graph's specifiers, for the two places that resolve them again.
+ *
+ * **Because some specifiers cannot be resolved twice.** A relative path is arithmetic and anyone can
+ * redo it; `@/` needs the importing file's project, which is why `roots` is here; and a *mapping* —
+ * `design/lang/0009` D9 — needs a manifest, a lockfile and a cache, none of which the compiler may
+ * read. So for a mapped import the reader records the answer and the compiler is told, rather than
+ * being given the ingredients and a way to open files.
+ *
+ * `roots` is parallel to the graph's `paths`. The three `map*` arrays are one entry per mapped
+ * import: the file that wrote it, the specifier as written, and the key it resolved to. Empty for
+ * every program that uses no mappings, which is all of them until somebody writes a `wac.json5`.
+ */
+export struct Res {
+  // **Read-only once built**, and declared so: a resolver is handed around as `const Res`, and a
+  // narrowed copy of one (`diagnoseFilesIn`) shares the mapping arrays rather than copying them.
+  const string[] roots;
+  const string[] mapFrom;
+  const string[] mapSpec;
+  const string[] mapTo;
+  /**
+   * The directory every relative key in this graph is measured from — the working directory.
+   *
+   * "" for a caller with no filesystem, which is every caller that cannot have a `@/` above its
+   * base anyway. It exists so a discovered project root that sits *above* the base can be joined
+   * and then brought back into the graph's own key space; `relativeTo` is where that happens and
+   * says why one file would otherwise get two keys.
+   */
+  string base;
+
+  /** Nothing known — what every caller without a filesystem passes. */
+  Res empty() {
+    return Res(string[].filled(0, ""), string[].filled(0, ""), string[].filled(0, ""), string[].filled(0, ""), "");
+  }
+
+  /** Just the roots, for a caller that has those and no mappings. */
+  Res of(string[] roots) {
+    return Res(roots, string[].filled(0, ""), string[].filled(0, ""), string[].filled(0, ""), "");
+  }
+
+  /**
+   * All five, for a host: bindgen generates a field-wise `of` only for a struct that declares none
+   * (spec ch48), and this one's `of` takes the roots alone.
+   */
+  Res whole(string[] roots, string[] mapFrom, string[] mapSpec, string[] mapTo, string base) {
+    return Res(roots, mapFrom, mapSpec, mapTo, base);
+  }
+
+  /** The project `path` sits in, or "" — keyed by position against the graph's `paths`. */
+  string rootAt(const this, string[] paths, string path) {
+    for (i32 i = 0; i < paths.len() && i < this.roots.len(); i++) {
+      if (paths[i] == path) { return this.roots[i]; }
+    }
+    return "";
+  }
+
+  /** The key `from` importing `spec` resolved to, or "" when it was not a mapping. */
+  string mappedTo(const this, string from, string spec) {
+    for (i32 i = 0; i < this.mapFrom.len() && i < this.mapSpec.len() && i < this.mapTo.len(); i++) {
+      if (this.mapFrom[i] == from && this.mapSpec[i] == spec) { return this.mapTo[i]; }
+    }
+    return "";
+  }
+}
+
+/**
+ * `spec` as `from` means it, using what the reader worked out.
+ *
+ * A mapping first, because only the reader could have resolved one; then the ordinary rule with the
+ * importing file's project root.
+ */
+export string resolveVia(const Res res, string[] paths, string from, string spec) {
+  string mapped = res.mappedTo(from, spec);
+  if (mapped != "") { return mapped; }
+  return resolveFromAt(from, spec, res.rootAt(paths, from), res.base);
+}
+
+/**
+ * Whether `s` ends with `p` — string arithmetic, in the module that holds the rest of it.
+ *
+ * **There were two private copies**, in `check.wac` and `bindgen.wac`, written the same day and
+ * spelled two ways: one sliced and compared, the other walked the bytes. Neither was wrong, and a
+ * second copy is one that drifts.
+ */
+export bool endsWith(string s, string p) {
+  return s.len() >= p.len() && s.slice(s.len() - p.len(), s.len()) == p;
+}
+
+/**
+ * Whether `s` starts with `p`, here for the same reason and by the same history as `endsWith`.
+ *
+ * There were two private copies, byte for byte identical, in `manifest.wac` and `bindgen.wac`. Two
+ * copies of a two-line function cost nothing to keep and nothing to write; what they cost is that a
+ * module-private name is no longer unique across the program, and the bootstrap's flattener — which
+ * concatenates every module into one — has to rename one of them to keep them apart. Cheaper to
+ * have one.
+ */
+export bool startsWith(string s, string p) {
+  return s.len() >= p.len() && s.slice(0, p.len()) == p;
+}

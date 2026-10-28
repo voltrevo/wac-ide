@@ -1,0 +1,103 @@
+// Colouring wac source with the compiler's own lexer.
+//
+// **The lexer decides what a token is**, so a keyword, a string with `\{…}` in it or a number with an
+// exponent is coloured exactly as the compiler reads it — and a change to the language changes the
+// colours with no second grammar to keep in step. The lexer keeps no comments, so a comment is found the
+// other way round: a stretch between two tokens that starts `//` or `/*`.
+//
+// The answer is a list of spans over the whole text, which the editor cuts into chunks of lines: a
+// comment opened above a chunk changes that chunk's spans, and so redraws it, even though its text did
+// not change.
+
+import { Vec } from "core";
+import { lexTokensOf, lexTokenStride, tokenKindName } from "../vendor/wac/packages/wacc/src/api.wac";
+
+/** A coloured stretch: bytes `start` to `end`, of class `cls` — "k", "s", "n", "c", "l", "t". */
+export struct Span {
+  i32 start;
+  i32 end;
+  string cls;
+}
+
+/** What a token kind is coloured as, or "" for plain. */
+export string classOf(string kind) {
+  if (kind == "int" || kind == "float") { return "n"; }
+  if (kind == "string" || kind == "char") { return "s"; }
+  if (kind == "bool" || kind == "true" || kind == "false" || kind == "null") { return "l"; }
+  if (kind == "ident") { return ""; }
+  u8[] b = kind.toBytes();
+  if (b.len() == 0) { return ""; }
+  for (i32 i = 0; i < b.len(); i++) {
+    if (!((b[i] >= 'a' && b[i] <= 'z') || b[i] == '_')) { return ""; }
+  }
+  return "k";
+}
+
+/** The kinds the lexer has, coloured once rather than per token. */
+string[] classTable() {
+  string[] out = string[].filled(256, "");
+  for (i32 k = 0; k < 256; k++) { out[k] = classOf(tokenKindName(k)); }
+  return out;
+}
+
+bool startsType(u8 c) { return c >= 'A' && c <= 'Z'; }
+
+bool primitive(string w) {
+  return w == "i32" || w == "i64" || w == "u8" || w == "u16" || w == "u32" || w == "u64" || w == "i8" || w == "i16"
+      || w == "f32" || w == "f64" || w == "bool" || w == "string" || w == "void" || w == "auto" || w == "union";
+}
+
+/** The comments in `b` between `from` and `to`, which hold no token. */
+void comments(u8[] b, i32 from, i32 to, Vec<Span> out) {
+  i32 i = from;
+  while (i + 1 < to) {
+    if (b[i] == '/' && b[i + 1] == '/') {
+      i32 e = i;
+      while (e < to && b[e] != '\n') { e++; }
+      out.push(Span(i, e, "c"));
+      i = e;
+    } else if (b[i] == '/' && b[i + 1] == '*') {
+      i32 e = i + 2;
+      while (e + 1 < to && !(b[e] == '*' && b[e + 1] == '/')) { e++; }
+      e = e + 2 > to ? to : e + 2;
+      out.push(Span(i, e, "c"));
+      i = e;
+    } else {
+      i++;
+    }
+  }
+}
+
+/** Every coloured stretch of `text`, in order and not overlapping. */
+export Span[] spansOf(string text) {
+  u8[] b = text.toBytes();
+  i32[] toks = lexTokensOf(b);
+  i32 stride = lexTokenStride();
+  string[] table = classTable();
+  Vec<Span> out = Vec.create();
+  i32 at = 0;
+  for (i32 t = 0; t + stride <= toks.len(); t += stride) {
+    i32 kind = toks[t];
+    i32 start = toks[t + 1];
+    i32 len = toks[t + 2];
+    if (len <= 0 || start + len > b.len()) { continue; }
+    string cls = kind >= 0 && kind < 256 ? table[kind] : "";
+    // An interpolated string arrives as overlapping pieces — `"a \{` then `} b"` — with synthetic
+    // tokens between them, so a piece is clipped to what is not coloured yet and the rest skipped.
+    if (start < at) {
+      if (cls != "s" || start + len <= at) { continue; }
+      len = start + len - at;
+      start = at;
+    }
+    if (start > at) { comments(b, at, start, out); }
+    if ((cls == "n" && b[start] == '\'') || (cls == "" && b[start] == '"')) { cls = "s"; }
+    if (cls == "") {
+      string w = text.slice(start, start + len);
+      if (primitive(w)) { cls = "t"; } else if (startsType(b[start])) { cls = "y"; }
+    }
+    if (cls != "") { out.push(Span(start, start + len, cls)); }
+    at = start + len;
+  }
+  if (at < b.len()) { comments(b, at, b.len(), out); }
+  return out.toArray();
+}

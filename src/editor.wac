@@ -1,0 +1,217 @@
+// The editor: a textarea for typing, over the same text drawn in colour.
+//
+// **The layers, and why they line up.** The text is drawn twice in the same font, size and padding: once
+// in a textarea, whose letters are transparent so only its caret and selection show, and once behind it in
+// spans coloured by the compiler's lexer. Neither scrolls. Both are as tall as the whole file and as wide
+// as its longest line, inside one container that scrolls — so they cannot drift apart, and the page never
+// needs to know or set a scroll position, which it cannot. Diagnostics are a third layer: an underline
+// and a message placed by line and column.
+//
+// **Big files redraw little.** The coloured text is cut into chunks of `CHUNK` lines, each a component
+// handed its text and its colours as strings: a keystroke changes one chunk's text, and only that chunk
+// is drawn again. A comment opened above a chunk changes its colours, and redraws it too.
+
+import { Buf, Vec } from "core";
+import { ElementEvent, Node, Ref, Ui, html.div, html.pre, html.span, html.textarea } from "web";
+import { Span, spansOf } from "./highlight.wac";
+import { Diag } from "./diag.wac";
+
+static i32 CHUNK = 50;
+
+/** An open file. */
+export struct Doc {
+  /** Its path on the disk, `projects/<name>/…`. */
+  string path;
+  string text;
+  /** What is on the disk: the text is unsaved while it differs. */
+  string saved;
+  /** Not text: shown as a note rather than edited. */
+  bool binary;
+  bool loaded;
+  Span[] spans;
+  /** Where each line starts, in bytes. */
+  i32[] starts;
+  i32 widest;
+  /** Bumped by each edit. */
+  i32 version;
+  /** A line to bring into view, and a number that changes each time it is asked. */
+  i32 jumpLine;
+  i32 jumpSeq;
+}
+
+export Doc newDoc(string path) {
+  return Doc(path, "", "", false, false, Span[](), [0], 0, 0, 0, 0);
+}
+
+/** Take in new text: its lines and colours. Only `.wac` is coloured. */
+export void retext(Doc d, string text) {
+  d.text = text;
+  u8[] b = text.toBytes();
+  Vec<i32> starts = Vec.create();
+  starts.push(0);
+  i32 widest = 0;
+  i32 lineStart = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == '\n') {
+      if (i - lineStart > widest) { widest = i - lineStart; }
+      starts.push(i + 1);
+      lineStart = i + 1;
+    }
+  }
+  if (b.len() - lineStart > widest) { widest = b.len() - lineStart; }
+  d.starts = starts.toArray();
+  d.widest = widest;
+  d.spans = d.path.len() > 4 && d.path.slice(d.path.len() - 4, d.path.len()) == ".wac" ? spansOf(text) : Span[]();
+  d.version++;
+}
+
+export bool dirty(Doc d) { return d.loaded && !d.binary && d.text != d.saved; }
+
+i32 lineCount(Doc d) { return d.starts.len(); }
+
+/** The text of lines `from` to `to` (exclusive), without the final newline. */
+string linesText(Doc d, i32 from, i32 to) {
+  i32 s = d.starts[from];
+  i32 e = to < d.starts.len() ? d.starts[to] - 1 : d.text.len();
+  return d.text.slice(s, e < s ? s : e);
+}
+
+/** A chunk's colours, relative to its start, as `start,end,class;` — a string, so equal ones compare equal. */
+string sigOf(Doc d, i32 from, i32 to, i32 firstSpan) {
+  i32 s = d.starts[from];
+  i32 e = to < d.starts.len() ? d.starts[to] - 1 : d.text.len();
+  string out = "";
+  for (i32 k = firstSpan; k < d.spans.len(); k++) {
+    Span sp = d.spans[k];
+    if (sp.start >= e) { break; }
+    if (sp.end <= s) { continue; }
+    i32 a = sp.start < s ? s : sp.start;
+    i32 z = sp.end > e ? e : sp.end;
+    out = out + "\{a - s},\{z - s},\{sp.cls};";
+  }
+  return out;
+}
+
+i32 parseInt(string s, i32 at, i32 end) {
+  i32 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = at; i < end; i++) { n = n * 10 + ((b[i] - '0') as i32); }
+  return n;
+}
+
+/** One chunk of coloured lines. */
+Node Chunk(Ui ui, string text, string sig, i32 lines) {
+  Vec<Node> out = Vec.create();
+  u8[] b = sig.toBytes();
+  i32 at = 0;
+  i32 i = 0;
+  while (i < b.len()) {
+    i32 c1 = i;
+    while (b[c1] != ',') { c1++; }
+    i32 c2 = c1 + 1;
+    while (b[c2] != ',') { c2++; }
+    i32 c3 = c2 + 1;
+    while (b[c3] != ';') { c3++; }
+    i32 s = parseInt(sig, i, c1);
+    i32 e = parseInt(sig, c1 + 1, c2);
+    string cls = sig.slice(c2 + 1, c3);
+    if (s > at) { out.push(Node.Text(text.slice(at, s))); }
+    out.push(<span class={"h" + cls}>{text.slice(s, e)}</span>);
+    at = e;
+    i = c3 + 1;
+  }
+  if (at < text.len()) { out.push(Node.Text(text.slice(at, text.len()))); }
+  return <div class="chunk" style={"height:calc(var(--lh) * \{lines})"}>{out.toArray()}</div>;
+}
+
+string numbers(i32 n) {
+  Buf b = Buf.create();
+  for (i32 i = 1; i <= n; i++) {
+    if (i > 1) { b.push('\n'); }
+    b.pushDecimal(i);
+  }
+  return string.fromBytes(b.take());
+}
+
+/**
+ * What one diagnostic draws: an underline, and — for the first on its line — its message at the end of
+ * the line, with how many more there are, since several messages there would sit on top of each other.
+ */
+Node mark(Doc d, Diag g, i32 more) {
+  i32 line = g.line - 1 < lineCount(d) ? g.line - 1 : lineCount(d) - 1;
+  i32 s = d.starts[line];
+  i32 e = line + 1 < d.starts.len() ? d.starts[line + 1] - 1 : d.text.len();
+  i32 width = g.width;
+  if (g.col - 1 + width > e - s) { width = e - s - (g.col - 1); }
+  if (width < 1) { width = 1; }
+  string cls = g.warning ? "warn" : "err";
+  string top = "top:calc(var(--lh) * \{line})";
+  return <>
+    <div class={"squig " + cls} style={"\{top};left:\{g.col - 1}ch;width:\{width}ch"}></div>
+    {more >= 0 ? <div class={"lens " + cls} style={"\{top};left:\{e - s + 3}ch"}>{g.message}{more > 0 ? <span class="more">{" +\{more}"}</span> : Node.Text("")}</div>
+               : Node.Text("")}
+  </>;
+}
+
+/**
+ * A file, editable. `diags` are this file's diagnostics, and `diagKey` names them, so the editor redraws
+ * when they change; `onEdit` hears each edit after the document has taken it in.
+ */
+export Node Editor(Ui ui, Doc doc, i32 version, Diag[] diags, string diagKey, i32 jumpSeq, i32 focusSeq, fn<void()> onEdit) {
+  Ref area = ui.ref();
+  Ref target = ui.ref();
+  // Focused when it comes to the front — `focusSeq` changes — or when its file arrives after that.
+  ui.effect("\{focusSeq}|\{doc.loaded}", () => {
+    if (focusSeq > 0 && area.element() is not null) { area.element()!.focus(); }
+    return () => { };
+  });
+  ui.effect("\{jumpSeq}", () => {
+    if (jumpSeq > 0 && target.element() is not null) { target.element()!.scrollIntoView(); }
+    return () => { };
+  });
+  if (!doc.loaded) { return <div class="ednote">Opening…</div>; }
+  if (doc.binary) { return <div class="ednote">This file is not text ({doc.saved.len()} bytes), so it is not shown.</div>; }
+  i32 n = lineCount(doc);
+  Node[] chunks = Node[].filled((n + CHUNK - 1) / CHUNK, Node.Text(""));
+  i32 sp = 0;
+  for (i32 c = 0; c < chunks.len(); c++) {
+    i32 from = c * CHUNK;
+    i32 to = from + CHUNK < n ? from + CHUNK : n;
+    i32 s = doc.starts[from];
+    while (sp < doc.spans.len() && doc.spans[sp].end <= s) { sp++; }
+    chunks[c] = <Chunk key={"c\{c}"} text={linesText(doc, from, to)} sig={sigOf(doc, from, to, sp)} lines={to - from}/>;
+  }
+  Node[] marks = Node[].filled(diags.len(), Node.Text(""));
+  for (i32 i = 0; i < diags.len(); i++) {
+    // -1 for all but the first on a line; for the first, how many others share it.
+    i32 more = 0;
+    bool first = true;
+    for (i32 k = 0; k < diags.len(); k++) {
+      if (diags[k].line != diags[i].line) { continue; }
+      if (k < i) { first = false; } else if (k > i) { more++; }
+    }
+    marks[i] = mark(doc, diags[i], first ? more : -1);
+  }
+  i32 jl = doc.jumpLine < 1 ? 0 : doc.jumpLine - 1;
+  // Wider and taller than the text by a margin, so the textarea never scrolls inside itself — which it
+  // does, overflow hidden or not, to keep its caret in view, and its letters would leave their colours.
+  string size = "width:calc(\{doc.widest + 40}ch + 2 * var(--padx));height:calc(var(--lh) * \{n + 10} + 2 * var(--pady))";
+  return <div class="editor">
+    <div class="scroller">
+      <div class="code">
+        <pre class="gutter">{numbers(n)}</pre>
+        <div class="text" style={size}>
+          <div class="layer">{chunks}</div>
+          <div class="marks">
+            {marks}
+            <div class={jumpSeq > 0 ? "jump on" : "jump"} key={"j\{jumpSeq}"} ref={target} style={"top:calc(var(--lh) * \{jl - 3 < 0 ? 0 : jl - 3})"}></div>
+            {jumpSeq > 0 ? <div class="flash" key={"f\{jumpSeq}"} style={"top:calc(var(--lh) * \{jl})"}></div> : Node.Text("")}
+          </div>
+          <textarea class="input" ref={area} spellcheck="false" autocomplete="off" value={doc.text}
+                    prevent="Tab"
+                    oninput={(ElementEvent e) => { retext(doc, e.value); onEdit(); }}></textarea>
+        </div>
+      </div>
+    </div>
+  </div>;
+}

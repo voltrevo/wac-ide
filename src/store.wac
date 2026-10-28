@@ -1,0 +1,211 @@
+// Projects, kept in the browser's storage under `projects/<name>/`.
+//
+// **One `Fs` for everything**: the browser's Origin Private File System when the page is served, so a
+// project survives a reload; memory when it is opened from a file, where the browser refuses that
+// storage. The checker reads the same storage from its own worker (see `checker.wac`).
+//
+// A project arrives as a dropped folder or as an archive — `git archive`'s .tar.gz, GitHub's .zip. Either
+// way the things no editor wants are left out (`.git`, `node_modules`, build output), and an archive whose
+// files all sit in one folder, as GitHub's do, loses that folder.
+
+import { Map, Ticket, Vec, hashString, stringEq } from "core";
+import { Change, Cli, FileResult, Stat } from "std";
+import { Fs } from "../vendor/wac/packages/fs/src/fs.wac";
+import { Archive, Opened, extract, openArchive } from "./archive.wac";
+import { sniff } from "./sniff.wac";
+
+export static string PROJECTS = "projects";
+
+/** A file arriving: its path inside the project, and its bytes. */
+export struct Incoming {
+  string path;
+  u8[] bytes;
+}
+
+/** An entry in a folder. */
+export struct Entry {
+  string name;
+  bool isDir;
+}
+
+export string rootOf(string project) { return "\{PROJECTS}/\{project}"; }
+string abs(string p) { return "/" + p; }
+
+/** The folder part of a path: "a/b" for "a/b/c", "" for "c". */
+export string parentOf(string path) {
+  u8[] b = path.toBytes();
+  for (i32 i = b.len() - 1; i >= 0; i--) { if (b[i] == '/') { return path.slice(0, i); } }
+  return "";
+}
+
+export string leafOf(string path) {
+  u8[] b = path.toBytes();
+  for (i32 i = b.len() - 1; i >= 0; i--) { if (b[i] == '/') { return path.slice(i + 1, path.len()); } }
+  return path;
+}
+
+export string join(string dir, string name) { return dir == "" ? name : dir + "/" + name; }
+
+/** Whether a path in a project is one an editor has no use for. */
+export bool ignored(string path) {
+  string[] skip = [".git", "node_modules", "target", "dist", ".wac-src", ".DS_Store"];
+  i32 start = 0;
+  u8[] b = path.toBytes();
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '/') {
+      string part = path.slice(start, i);
+      for (i32 k = 0; k < skip.len(); k++) { if (part == skip[k]) { return true; } }
+      start = i + 1;
+    }
+  }
+  return false;
+}
+
+/** The folder every path begins with, when there is one and nothing sits beside it; "" otherwise. */
+export string commonTop(string[] paths) {
+  if (paths.len() == 0) { return ""; }
+  i32 cut = paths[0].indexOf("/");
+  if (cut <= 0) { return ""; }
+  string top = paths[0].slice(0, cut + 1);
+  for (i32 i = 1; i < paths.len(); i++) {
+    if (paths[i].len() <= top.len() || paths[i].slice(0, top.len()) != top) { return ""; }
+  }
+  return top.slice(0, top.len() - 1);
+}
+
+/** The project names there are, sorted. */
+export async string[] projects(Fs fs) {
+  string[]? names = await fs.readDir(abs(PROJECTS));
+  if (names is null) { return string[](); }
+  return sortedNames(names!);
+}
+
+string[] sortedNames(string[] xs) {
+  string[] out = string[].filled(xs.len(), "");
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  for (i32 i = 1; i < out.len(); i++) {
+    string v = out[i];
+    i32 j = i - 1;
+    while (j >= 0 && lowerOf(out[j]) > lowerOf(v)) { out[j + 1] = out[j]; j--; }
+    out[j + 1] = v;
+  }
+  return out;
+}
+
+export string lowerOf(string s) {
+  u8[] b = s.toBytes();
+  u8[] o = u8[].filled(b.len(), 0 as u8);
+  for (i32 i = 0; i < b.len(); i++) { o[i] = b[i] >= 'A' && b[i] <= 'Z' ? b[i] + 32 : b[i]; }
+  return string.fromBytes(o);
+}
+
+/** What is in `dir` of the disk: folders first, then files, each alphabetically. */
+export async Entry[] list(Fs fs, string dir) {
+  string[]? names = await fs.readDir(abs(dir));
+  if (names is null) { return Entry[](); }
+  string[] sorted = sortedNames(names!);
+  Vec<Entry> dirs = Vec.create();
+  Vec<Entry> files = Vec.create();
+  for (i32 i = 0; i < sorted.len(); i++) {
+    if (ignored(sorted[i])) { continue; }
+    Stat st = await fs.stat(abs(join(dir, sorted[i])));
+    if (st.isDir) { dirs.push(Entry(sorted[i], true)); } else { files.push(Entry(sorted[i], false)); }
+  }
+  for (i32 i = 0; i < files.len(); i++) { dirs.push(files.get(i)); }
+  return dirs.toArray();
+}
+
+/** Every file below `dir`, as paths relative to it — for quick open. */
+export async void walk(Fs fs, string dir, string rel, Vec<string> out) {
+  string[]? names = await fs.readDir(abs(rel == "" ? dir : join(dir, rel)));
+  if (names is null) { return; }
+  for (i32 i = 0; i < names!.len(); i++) {
+    string n = names![i];
+    if (ignored(n)) { continue; }
+    string sub = join(rel, n);
+    Stat st = await fs.stat(abs(join(dir, sub)));
+    if (st.isDir) { await walk(fs, dir, sub, out); } else { out.push(sub); }
+  }
+}
+
+export async FileResult read(Fs fs, string path) { return await fs.readFile(abs(path)); }
+
+export async Change write(Fs fs, string path, u8[] bytes) {
+  string dir = parentOf(path);
+  if (dir != "") { await fs.mkdir(abs(dir), true); }
+  return await fs.writeFile(abs(path), bytes);
+}
+
+export async Change remove(Fs fs, string path) { return await fs.remove(abs(path), true); }
+
+/** What an archive holds, as files; empty with `why` set when it is not one this can open. */
+export struct Unpacked {
+  Incoming[] files;
+  string why;
+}
+
+/** The files of an archive — a .tar.gz opened through to its tar. */
+export Unpacked unpack(u8[] bytes, string name) {
+  Opened o = openArchive(bytes, sniff(bytes, name), name);
+  if (o.archive is null) { return Unpacked(Incoming[](), o.error == "" ? "\{name} is not an archive" : o.error); }
+  Archive a = o.archive!;
+  if (a.entries.len() == 1 && !a.entries[0].isDir) {
+    Opened inner = openArchive(a.data, sniff(a.data, a.entries[0].path), a.entries[0].path);
+    if (inner.archive is not null) { a = inner.archive!; }
+  }
+  Vec<Incoming> out = Vec.create();
+  for (i32 i = 0; i < a.entries.len(); i++) {
+    if (a.entries[i].isDir || ignored(a.entries[i].path)) { continue; }
+    out.push(Incoming(a.entries[i].path, extract(a, a.entries[i]).bytes));
+  }
+  return Unpacked(out.toArray(), "");
+}
+
+/**
+ * Write `files` into the project `name`, a batch of writes at a time; `progress` hears how many are
+ * done. Answers how many were written.
+ */
+export async i32 store(Fs fs, string name, Incoming[] files, fn<void(i32)> progress) {
+  string[] paths = string[].filled(files.len(), "");
+  for (i32 i = 0; i < files.len(); i++) { paths[i] = files[i].path; }
+  string top = commonTop(paths);
+  string root = rootOf(name);
+  Map<string, bool> made = Map.create(hashString, stringEq);
+  i32 done = 0;
+  i32 i = 0;
+  while (i < files.len()) {
+    Vec<Ticket<Change>> batch = Vec.create();
+    i32 end = i + 24 < files.len() ? i + 24 : files.len();
+    for (; i < end; i++) {
+      string rel = top == "" ? files[i].path : files[i].path.slice(top.len() + 1, files[i].path.len());
+      string p = join(root, rel);
+      string dir = parentOf(p);
+      if (made.get(dir) is null) { await fs.mkdir(abs(dir), true); made.set(dir, true); }
+      batch.push(fs.writeFile(abs(p), files[i].bytes));
+    }
+    for (i32 k = 0; k < batch.len(); k++) { if ((await batch.get(k)).ok()) { done++; } }
+    progress(done);
+  }
+  return done;
+}
+
+/** A name for a project made from `name`, not taken by one of `taken`. */
+export string projectName(string name, string[] taken) {
+  string base = name;
+  string[] exts = [".tar.gz", ".tgz", ".tar.zst", ".zip", ".tar"];
+  for (i32 i = 0; i < exts.len(); i++) {
+    if (base.len() > exts[i].len() && lowerOf(base.slice(base.len() - exts[i].len(), base.len())) == exts[i]) {
+      base = base.slice(0, base.len() - exts[i].len());
+      break;
+    }
+  }
+  if (base == "") { base = "project"; }
+  string candidate = base;
+  for (i32 n = 2; n < 1000; n++) {
+    bool clash = false;
+    for (i32 k = 0; k < taken.len(); k++) { if (taken[k] == candidate) { clash = true; } }
+    if (!clash) { return candidate; }
+    candidate = "\{base} \{n}";
+  }
+  return candidate;
+}

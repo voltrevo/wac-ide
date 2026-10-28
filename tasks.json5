@@ -1,0 +1,10 @@
+{
+  // The IDE as dist/index.html: the page, and a copy of it that checks code in the background.
+  build: "wac run --allow-read --allow-write --allow-run build.wac src/ide.wac dist --title 'wac IDE' --grant read,write --spawn checker",
+  serve: "wac sh --allow-read --allow-net -c 'httpd -8080 dist'",
+  test: "wac test test",
+  // In Chromium, against dist/ — build first; needs Playwright.
+  "test:ide": "node tools/ide_test.js",
+  // Copy the compiler and the `wac` command's gathering from a wac checkout into vendor/wac/.
+  vendor: "python3 tools/vendor_wac.py",
+}

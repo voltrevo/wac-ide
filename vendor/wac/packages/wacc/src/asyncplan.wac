@@ -1,0 +1,531 @@
+// What an `async` function's body would lower to, decided before any of it is written —
+// `design/lang/0014` step 4.
+//
+// The rewrite needs three facts about a body: **where the suspension points are**, **whether the
+// shape is one this cut can flatten**, and **which locals outlive a suspension**. All three are
+// questions about the AST alone, so they are answered here, on their own, with their own tests —
+// rather than discovered halfway through generating code, where a wrong answer becomes a module that
+// validates and misbehaves.
+//
+// **The walks are exhaustive on purpose.** An `else` arm would make a new `ExprKind` invisible here,
+// and the cost of that is exact: `Await` itself was added on 2026-08-30 and five matches had to be
+// told about it, one of them `findLambdasExpr`, where missing it would have lost a lambda and
+// produced an invalid module rather than a diagnostic. A walk that decides whether a body contains an
+// `await` is the last place to accept a silent default.
+//
+// ## What this cut can flatten
+//
+// **Every statement holding an `await` reaches the plan already linear**: `asynclower.wac`'s split has
+// rewritten it so each `await` stands alone — `T x = await e;`, `await e;` or `return await e;` — with
+// whatever ran before it in temporaries and whatever runs only sometimes (the right of `&&`, an arm of
+// `?:` or `match`, a loop's test) made into the control flow it means. So the plan counts those three
+// shapes, hoists every local at any depth, and walks into `if`, the loops, `switch`, `match` arms and
+// the `static_if` a `for … in` is written as. What it still declines, by name, is a `defer` in the
+// machine's own body and an `await` inside a `static_for`.
+
+import {
+  Arm, Case, Decl, DeclKind, Expr, ExprKind, Lvalue, LvalueKind, Program, Stmt, StmtKind, Ty,
+  TyKind,
+} from "./ast.wac";
+
+/** What the rewrite needs to know about one `async` function. */
+export struct AsyncPlan {
+  /** Whether this cut can flatten it. When false, `why` says what stopped it. */
+  bool ok;
+  /** The refusal, in the words the reader should see. Empty when `ok`. */
+  string why;
+  /** Indices into the body of the statements that suspend, in order. */
+  i32[] suspendAt;
+  /** Name tokens of the locals that must outlive a suspension, at any depth. */
+  i32[] hoist;
+  /**
+   * Each hoisted local's declared type, parallel to `hoist`.
+   *
+   * **Collected by the same walk**, because the two must agree element for element and a second walk
+   * that recreates the traversal is a second thing to get wrong — which it was, the moment locals
+   * started being hoisted out of loop bodies and `for` initialisers as well as the top level.
+   */
+  Ty[] hoistTy;
+}
+
+/** How many suspension points, which is how many slots the tail must carry. */
+export i32 planSuspends(AsyncPlan p) { return p.suspendAt.len(); }
+
+// ── Does this contain an `await`? ─────────────────────────────────────────────
+
+/** Whether `e` contains an `await` anywhere inside it. */
+export bool awaitInExpr(Expr e) {
+  match (e.kind) {
+    TypeRefOf(t): { return false; }
+    StaticMatch(subject, types, values, defaultAt): { return false; }
+    StaticTrapE(message): { return false; }
+    Await(operand): { return true; }
+    Try(operand): { return awaitInExpr(operand); }
+    CoroutineOf(call): { return awaitInExpr(call); }
+    MatchExpr(subject, arms): {
+      if (awaitInExpr(subject)) { return true; }
+      for (i32 i = 0; i < arms.len(); i++) {
+        // **An expression arm keeps its value in `value`, not `body`** — `Err(_): await p` has no
+        // statements at all. Asking only the body missed it, so the statement was never split and
+        // the `await` ran in place: a trap the first time the ticket was not yet settled
+        // (`issues/lang/0363a`).
+        if (arms[i].value is not null && awaitInExpr(arms[i].value!)) { return true; }
+        if (awaitInBody(arms[i].body)) { return true; }
+      }
+      return false;
+    }
+    IntLit(tok): { return false; }
+    FloatLit(tok): { return false; }
+    StrLit(tok): { return false; }
+    Jsx(tagTok, closeTok, attrs, kids): {
+      for (i32 i = 0; i < attrs.len(); i++) {
+        if (awaitInExpr(attrs[i].value)) { return true; }
+      }
+      for (i32 i = 0; i < kids.len(); i++) {
+        if (awaitInExpr(kids[i])) { return true; }
+      }
+      return false;
+    }
+    JsxText(startOff, endOff): { return false; }
+    BoolLit(value): { return false; }
+    NullLit: { return false; }
+    Ident(tok): { return false; }
+    Unary(op, operand): { return awaitInExpr(operand); }
+    Binary(op, left, right): { return awaitInExpr(left) || awaitInExpr(right); }
+    Cast(op, operand, target): { return awaitInExpr(operand); }
+    Is(left, target, other, negated): {
+      if (awaitInExpr(left)) { return true; }
+      return (other is not null) && awaitInExpr(other!);
+    }
+    Matches(pat, subject): { return awaitInExpr(subject); }
+    Ternary(cond, then, els): {
+      return awaitInExpr(cond) || awaitInExpr(then) || awaitInExpr(els);
+    }
+    Call(callee, args, typeArgs): {
+      if (awaitInExpr(callee)) { return true; }
+      for (i32 i = 0; i < args.len(); i++) {
+        if (awaitInExpr(args[i])) { return true; }
+      }
+      return false;
+    }
+    Index(arr, index): { return awaitInExpr(arr) || awaitInExpr(index); }
+    Member(obj, nameTok): { return awaitInExpr(obj); }
+    SafeMember(obj, nameTok): { return awaitInExpr(obj); }
+    SafeCall(call): { return awaitInExpr(call); }
+    Unwrap(operand): { return awaitInExpr(operand); }
+    Construct(ctype, args, named): {
+      for (i32 i = 0; i < args.len(); i++) {
+        if (awaitInExpr(args[i])) { return true; }
+      }
+      for (i32 i = 0; i < named.len(); i++) {
+        if (awaitInExpr(named[i].value)) { return true; }
+      }
+      return false;
+    }
+    TypeName(qualifier): { return false; }
+    Incr(target, op, prefix): { return awaitInLvalue(target); }
+    ArrLit(elements): {
+      for (i32 i = 0; i < elements.len(); i++) {
+        if (awaitInExpr(elements[i])) { return true; }
+      }
+      return false;
+    }
+    TupleLit(elements): {
+      for (i32 i = 0; i < elements.len(); i++) {
+        if (awaitInExpr(elements[i])) { return true; }
+      }
+      return false;
+    }
+    ArrNew(elem, size, fill, elements): {
+      if ((size is not null) && awaitInExpr(size!)) { return true; }
+      if ((fill is not null) && awaitInExpr(fill!)) { return true; }
+      for (i32 i = 0; i < elements.len(); i++) {
+        if (awaitInExpr(elements[i])) { return true; }
+      }
+      return false;
+    }
+    // **A lambda's body is not this function's.** An `await` in there is refused by the checker
+    // already — code 211, `issues/lang/0294c` — so it cannot be a suspension of *this* machine and
+    // must not be counted as one.
+    Lambda(params, body, lamAsync): { return false; }
+  }
+}
+
+export bool awaitInLvalue(Lvalue lv) {
+  match (lv.kind) {
+    LIdent(tok): { return false; }
+    LField(base, nameTok): { return awaitInLvalue(base); }
+    LIndex(base, index): { return awaitInLvalue(base) || awaitInExpr(index); }
+    LUnwrap(base): { return awaitInLvalue(base); }
+  }
+}
+
+/** Whether `s` contains an `await` anywhere inside it. */
+export bool awaitInStmt(Stmt s) {
+  match (s.kind) {
+    StaticIf(cond, then, els): { return awaitInExpr(cond) || awaitInBody(then) || awaitInBody(els); }
+    StaticTrap(message): { return false; }
+    StaticLocal(type, nameTok, init): { return false; }
+    StaticFor(init, cond, update, body): {
+      if ((init is not null) && awaitInStmt(init!)) { return true; }
+      return awaitInBody(body);
+    }
+    Var(type, nameTok, init, isConst): { return (init is not null) && awaitInExpr(init!); }
+    Assign(target, op, rhs): { return awaitInLvalue(target) || awaitInExpr(rhs); }
+    IncrStmt(target, op): { return awaitInLvalue(target); }
+    If(cond, then, els): {
+      return awaitInExpr(cond) || awaitInBody(then) || awaitInBody(els);
+    }
+    While(cond, body): { return awaitInExpr(cond) || awaitInBody(body); }
+    ForIn(elemTy, nameTok, iterable, body): { return awaitInExpr(iterable) || awaitInBody(body); }
+    Destructure(whole, pattern, init): { return awaitInExpr(init); }
+    TupleAssign(targets, rhs): {
+      for (i32 i = 0; i < targets.len(); i++) { if (awaitInLvalue(targets[i])) { return true; } }
+      return awaitInExpr(rhs);
+    }
+    For(init, cond, update, body): {
+      if ((init is not null) && awaitInStmt(init!)) { return true; }
+      if ((cond is not null) && awaitInExpr(cond!)) { return true; }
+      if ((update is not null) && awaitInStmt(update!)) { return true; }
+      return awaitInBody(body);
+    }
+    DoWhile(body, cond): { return awaitInBody(body) || awaitInExpr(cond); }
+    Switch(subject, cases): {
+      if (awaitInExpr(subject)) { return true; }
+      for (i32 i = 0; i < cases.len(); i++) {
+        if (!(cases[i].value is null) && awaitInExpr(cases[i].value!)) { return true; }
+        if (awaitInBody(cases[i].body)) { return true; }
+      }
+      return false;
+    }
+    Return(value): { return (value is not null) && awaitInExpr(value!); }
+    Defer(body): { return awaitInStmt(body); }
+    Break: { return false; }
+    Continue: { return false; }
+    Trap(value): { return (value is not null) && awaitInExpr(value!); }
+    Match(subject, arms): {
+      if (awaitInExpr(subject)) { return true; }
+      for (i32 i = 0; i < arms.len(); i++) {
+        if (awaitInBody(arms[i].body)) { return true; }
+      }
+      return false;
+    }
+    Block(body): { return awaitInBody(body); }
+    ExprStmt(expr): { return awaitInExpr(expr); }
+    Schedule(target): { return awaitInExpr(target); }
+    // A `yield` is a suspension as an `await` is — of a generator's machine (ch36).
+    Yield(value): { return true; }
+  }
+}
+
+/** Whether any statement in `body` contains an `await`. */
+export bool awaitInBody(Stmt[] body) {
+  for (i32 i = 0; i < body.len(); i++) {
+    if (awaitInStmt(body[i])) { return true; }
+  }
+  return false;
+}
+
+// ── The plan ─────────────────────────────────────────────────────────────────
+
+bool isAwait(Expr e) {
+  match (e.kind) {
+    Await(operand): { return true; }
+    default: { return false; }
+  }
+}
+
+/**
+ * The plan for one `async` body, or the reason there is none.
+ *
+ * Every top-level `Var` is hoisted, not only those measured to cross a suspension. Liveness would be
+ * a second analysis with its own way of being wrong, and hoisting one that did not need it costs a
+ * one-element array — while missing one that did costs a local that silently resets on resume. The
+ * cheap direction is the safe one here.
+ */
+export AsyncPlan planBody(Stmt[] body) {
+  if (body.len() == 0) { return AsyncPlan(true, "", i32[](), i32[](), Ty[]()); }
+  // **A machine's `return` is not a `return`**: it records an answer and stops stepping, so a deferred
+  // statement keyed to leaving the function would run at the wrong moment, or every time it suspends.
+  if (deferInBody(body)) {
+    return AsyncPlan(false, "a `defer` in an `async` function", i32[](), i32[](), Ty[]());
+  }
+  Walked w = Walked(i32[].filled(256, 0), 0, i32[].filled(256, 0), Ty[].filled(256, planAnyTy(body)), 0, "");
+  walkPlan(body, w);
+  if (w.why != "") { return AsyncPlan(false, w.why, i32[](), i32[](), Ty[]()); }
+  i32[] outAt = i32[].filled(w.n, 0);
+  for (i32 i = 0; i < w.n; i++) { outAt[i] = i; }
+  i32[] outH = i32[].filled(w.h, 0);
+  Ty[] outT = Ty[].filled(w.h, planAnyTy(body));
+  for (i32 i = 0; i < w.h; i++) { outH[i] = w.hoist[i]; outT[i] = w.hoistTy[i]; }
+  return AsyncPlan(true, "", outAt, outH, outT);
+}
+
+/** Whether a `defer` is anywhere in `body` outside a lambda. */
+bool deferInBody(Stmt[] body) {
+  for (i32 i = 0; i < body.len(); i++) {
+    match (body[i].kind) {
+      Defer(b): { return true; }
+      Block(b): { if (deferInBody(b)) { return true; } }
+      If(cond, then, els): { if (deferInBody(then) || deferInBody(els)) { return true; } }
+      While(cond, b): { if (deferInBody(b)) { return true; } }
+      DoWhile(b, cond): { if (deferInBody(b)) { return true; } }
+      For(init, cond, update, b): { if (deferInBody(b)) { return true; } }
+      Switch(subject, cases): {
+        for (i32 j = 0; j < cases.len(); j++) { if (deferInBody(cases[j].body)) { return true; } }
+      }
+      Match(subject, arms): {
+        for (i32 j = 0; j < arms.len(); j++) { if (deferInBody(arms[j].body)) { return true; } }
+      }
+      default: { }
+    }
+  }
+  return false;
+}
+
+/** The running answer while the body is walked. */
+struct Walked {
+  i32[] unused;
+  /** How many suspensions have been seen — the number of slots the machine needs. */
+  i32 n;
+  i32[] hoist;
+  Ty[] hoistTy;
+  i32 h;
+  string why;
+}
+
+/**
+ * Every suspension and every local, at any depth — **except inside a lambda**, whose body is a
+ * different function.
+ *
+ * `suspendAt` used to be indices into the top-level block, which only meant anything while a
+ * suspension could only *be* a top-level statement. With loops it cannot: a suspension inside a loop
+ * body has no index in the outer sequence, and the same one runs many times. What the rest of the
+ * machine needs from this is only *how many* there are, since each gets its own slot, so the list is
+ * now `0..n` and the walk that flattens finds them where they are.
+ */
+void walkPlan(Stmt[] body, Walked w) {
+  for (i32 i = 0; i < body.len(); i++) {
+    if (w.why != "") { return; }
+    Stmt s = body[i];
+    match (s.kind) {
+      // **Both shapes name the ticket's type, and that is why they are the two.** The machine has
+      // to keep the ticket it suspended at, in a slot of type `Pending<X>`, and the only way to
+      // know that from the AST is to have it written: `T x = await e;` says `T`, and
+      // `return await e;` says the function's own return type. A bare `await e;` says neither,
+      // which is why it is declined rather than counted. This rule lived in an `isSuspension`
+      // nothing called as well as here, until 2026-09-01 — `tools/wac/deadexports.wac` found it.
+      Var(type, nameTok, init, isConst): {
+        if (w.h < w.hoist.len()) {
+          w.hoist[w.h] = nameTok; w.hoistTy[w.h] = type; w.h = w.h + 1;
+        }
+        if ((init is not null) && isAwait(init!)) { w.n = w.n + 1; }
+        else if ((init is not null) && awaitInExpr(init!)) { w.why = "an `await` nested inside a larger expression, on a ticket whose type this file does not write — bind it first: `T v = await e;`"; }
+      }
+      Return(value): {
+        if ((value is not null) && isAwait(value!)) { w.n = w.n + 1; }
+        else if ((value is not null) && awaitInExpr(value!)) { w.why = "an `await` nested inside a larger expression, on a ticket whose type this file does not write — bind it first: `T v = await e;`"; }
+      }
+      If(cond, then, els): {
+        if (awaitInExpr(cond)) { w.why = "an `await` in an `if` condition"; }
+        walkPlan(then, w);
+        walkPlan(els, w);
+      }
+      While(cond, body2): {
+        if (awaitInExpr(cond)) { w.why = "an `await` in a `while` condition"; }
+        walkPlan(body2, w);
+      }
+      For(init, cond, update, body2): {
+        if ((init is not null) && awaitInStmt(init!)) { w.why = "an `await` in a `for` initialiser"; }
+        // **The induction variable is hoisted like any other.** It is declared once and read after
+        // every suspension in the body, so leaving it a plain local would reset it on resume — the
+        // loop would run its first iteration for ever.
+        if (init is not null) {
+          match (init!.kind) {
+            Var(type2, nameTok2, init2, isConst2): {
+              if (w.h < w.hoist.len()) {
+                w.hoist[w.h] = nameTok2; w.hoistTy[w.h] = type2; w.h = w.h + 1;
+              }
+            }
+            default: { }
+          }
+        }
+        if ((cond is not null) && awaitInExpr(cond!)) { w.why = "an `await` in a `for` condition"; }
+        walkPlan(body2, w);
+        // An update that suspends arrives as a block of linear statements, flattened where the update
+        // goes; its suspensions are counted and its temporaries hoisted like the body's.
+        if ((update is not null) && awaitInStmt(update!)) { walkPlan(Stmt[].filled(1, update!), w); }
+      }
+      // A `static_if` whose branches suspend — a `for … in` written both ways. Both are walked: their
+      // locals are hoisted and their suspensions counted, and the compiler keeps one.
+      StaticIf(cond, then, els): {
+        walkPlan(then, w);
+        walkPlan(els, w);
+      }
+      // A `switch` whose cases suspend: the subject is evaluated in the state that dispatches.
+      Switch(subject, cases): {
+        if (awaitInExpr(subject)) { w.why = "an `await` in a `switch` subject"; }
+        for (i32 j = 0; j < cases.len(); j++) { walkPlan(cases[j].body, w); }
+      }
+      Block(body2): { walkPlan(body2, w); }
+      // A `match` statement's arms, which the lowering flattens once `splitMatch` has given their
+      // bindings names it can hoist; the subject is evaluated in the state that dispatches.
+      Match(subject, arms): {
+        if (awaitInExpr(subject)) { w.why = "an `await` in a `match` subject"; }
+        for (i32 a = 0; a < arms.len(); a++) { walkPlan(arms[a].body, w); }
+      }
+      // `yield v;` — a generator's suspension (ch36). Its value is evaluated first, so an `await` in
+      // it is one more the lowering has already hoisted, or one it could not read.
+      Yield(value): {
+        if (value is not null && awaitInExpr(value!)) {
+          w.why = "an `await` nested inside a larger expression, on a ticket whose type this file does not write — bind it first: `T v = await e;`";
+        }
+      }
+      // `await e;` and `await;` — a suspension whose answer nothing reads, so it needs no slot type.
+      ExprStmt(expr): {
+        if (isAwait(expr)) {
+          w.n = w.n + 1;
+          if (awaitOperandHasAwait(expr)) { w.why = "an `await` nested inside a larger expression, on a ticket whose type this file does not write — bind it first: `T v = await e;`"; }
+        } else if (awaitInExpr(expr)) { w.why = "an `await` nested inside a larger expression, on a ticket whose type this file does not write — bind it first: `T v = await e;`"; }
+      }
+      default: {
+        if (awaitInStmt(s)) { w.why = declineFor(s); }
+      }
+    }
+    // **A reason says where it is.** `api.wac` reads the line off a `line N:` prefix and reports at
+    // line 1 without one — so every refusal from this walk pointed at the file's first line, an
+    // import, rather than at the `for` or the `defer` that caused it. A nested statement has already
+    // prefixed its own, which is the more precise one.
+    if (w.why != "" && !(w.why.len() > 5 && w.why.slice(0, 5) == "line ")) {
+      w.why = "line " + planLine(s.line) + ": " + w.why;
+    }
+  }
+}
+
+/** `n` in decimal, for a reason's `line N:` — this file may not use interpolation (it builds on wac-L5). */
+string planLine(i32 n) {
+  if (n <= 0) { return "0"; }
+  string out = "";
+  i32 v = n;
+  while (v > 0) {
+    out = string.fromBytes(u8[].filled(1, (48 + v % 10) as@ u8)) + out;
+    v = v / 10;
+  }
+  return out;
+}
+
+/** Whether an `await`'s own operand holds another `await`. */
+bool awaitOperandHasAwait(Expr e) {
+  match (e.kind) {
+    Await(operand): { return (operand is not null) && awaitInExpr(operand!); }
+    default: { return false; }
+  }
+}
+
+/**
+ * Why a statement holding an `await` is not a suspension this cut can flatten.
+ *
+ * Named by shape rather than reported as one message, because the two cases need different things
+ * next: an `await` in a loop wants the loop's back edge as a state, which is the increment after
+ * this; an `await` nested in a larger expression wants that expression split around it, which is a
+ * different piece of work again.
+ */
+string declineFor(Stmt s) {
+  match (s.kind) {
+    While(cond, body): { return "an `await` inside a `while`"; }
+    For(init, cond, update, body): { return "an `await` inside a `for`"; }
+    DoWhile(body, cond): { return "an `await` inside a `do`"; }
+    If(cond, then, els): { return "an `await` inside an `if`"; }
+    StaticIf(cond, then, els): { return "an `await` inside a `static_if`"; }
+    StaticFor(init, cond, update, body): { return "an `await` inside a `static_for`"; }
+    Switch(subject, cases): { return "an `await` inside a `switch`"; }
+    Match(subject, arms): { return "an `await` inside a `match`"; }
+    // Over a generator the split rewrites the loop into one it can flatten; over anything else it
+    // does not yet, and saying "a larger expression" sent the reader to hoist an `await` that already
+    // stood alone on its line.
+    ForIn(elemTy, nameTok, iterable, body): {
+      return "an `await` inside a `for … in` over something that is not a generator — index it instead: `for (i32 i = 0; i < xs.len(); i++)`";
+    }
+    Block(body): { return "an `await` inside a nested block"; }
+    Assign(target, op, rhs): { return "an `await` on the right of an assignment"; }
+    ExprStmt(expr): { return "an `await` nested inside a larger expression, on a ticket whose type this file does not write — bind it first: `T v = await e;`"; }
+    default: { return "an `await` nested inside a larger expression"; }
+  }
+}
+
+/**
+ * An upper bound on the states flattening `body` will allocate.
+ *
+ * **A bound, not a count**, because the tail of spellings has to be written before the flattening
+ * runs and every state is named by a numeral in it. Each statement costs at most one state for the
+ * run it sits in; a suspension costs two, a branch one, a loop three. Four per statement plus a
+ * constant covers all of that with room to spare, and being generous costs a few words in a comment
+ * at the end of the file.
+ */
+export i32 statesNeeded(Stmt[] body) { return 4 * planCountStmts(body) + 8; }
+
+/** Statements at every depth, not counting inside a lambda — the flattening does not go there. */
+i32 planCountStmts(Stmt[] body) {
+  i32 n = 0;
+  for (i32 i = 0; i < body.len(); i++) {
+    n = n + 1;
+    match (body[i].kind) {
+      If(cond, then, els): { n = n + planCountStmts(then) + planCountStmts(els); }
+      While(cond, b2): { n = n + planCountStmts(b2); }
+      For(init, cond, update, b2): { n = n + planCountStmts(b2) + 2; }
+      DoWhile(b2, cond): { n = n + planCountStmts(b2); }
+      Block(b2): { n = n + planCountStmts(b2); }
+      Switch(subject, cases): {
+        for (i32 j = 0; j < cases.len(); j++) { n = n + planCountStmts(cases[j].body); }
+      }
+      Match(subject, arms): {
+        for (i32 j = 0; j < arms.len(); j++) { n = n + planCountStmts(arms[j].body); }
+      }
+      default: { }
+    }
+  }
+  return n;
+}
+
+/** Any `Ty` from the body, purely to fill an array a reference type cannot default. */
+Ty planAnyTy(Stmt[] body) {
+  for (i32 i = 0; i < body.len(); i++) {
+    match (body[i].kind) {
+      Var(type, nameTok, init, isConst): { return type; }
+      default: { }
+    }
+  }
+  return Ty(TyKind.Prim(0 - 1), 1, 1);
+}
+
+/** The plan for every `async` function in `prog`, as one line each — for tests and for reading. */
+export string describePlans(Program prog) {
+  string out = "";
+  for (i32 d = 0; d < prog.decls.len(); d++) {
+    match (prog.decls[d].kind) {
+      Func(nameTok, returnType, params, body, exported, typeParams, isAsync): {
+        if (!isAsync) { continue; }
+        AsyncPlan p = planBody(body);
+        if (!p.ok) {
+          out = out + "declined: " + p.why + "\n";
+        } else {
+          out = out + "ok suspends=" + planDecimal(planSuspends(p))
+                    + " hoist=" + planDecimal(p.hoist.len()) + "\n";
+        }
+      }
+      default: { }
+    }
+  }
+  return out;
+}
+
+string planDecimal(i32 n) {
+  if (n == 0) { return "0"; }
+  string out = "";
+  i32 v = n;
+  while (v > 0) {
+    out = string.fromCodepoint(48 + v % 10) + out;
+    v = v / 10;
+  }
+  return out;
+}

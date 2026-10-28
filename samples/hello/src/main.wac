@@ -1,0 +1,9 @@
+// A small program, to try the IDE on.
+import { Sys } from "std";
+import { double } from "./util.wac";
+
+export i32 main(Sys sys) {
+  i32 n = double(21);
+  sys.core.log("the answer is \{n}");
+  return 0;
+}

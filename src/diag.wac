@@ -1,0 +1,76 @@
+// Diagnostics, from the compiler's wire.
+//
+// `diagnoseGraphIn` answers one diagnostic a line, its fields between tabs:
+//
+//     file  line  col  phase  message  note  hint  width  severity  contextStart
+//
+// and the line is ragged at the end — an error may stop at `width`, and only a warning says so. Lines and
+// columns count from 1. See `packages/wacc/src/render.wac`, which reads the same wire for a person.
+
+import { Vec } from "core";
+
+export struct Diag {
+  string file;
+  /** From 1. */
+  i32 line;
+  /** From 1. */
+  i32 col;
+  string message;
+  string note;
+  string hint;
+  /** How many columns the caret covers; at least 1. */
+  i32 width;
+  bool warning;
+}
+
+i32 number(string s) {
+  i32 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return n; }
+    n = n * 10 + ((b[i] - '0') as i32);
+  }
+  return n;
+}
+
+string[] fields(string line) {
+  Vec<string> out = Vec.create();
+  i32 start = 0;
+  u8[] b = line.toBytes();
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '\t') { out.push(line.slice(start, i)); start = i + 1; }
+  }
+  return out.toArray();
+}
+
+/** Every diagnostic on the wire, in its order. A line too short to be one is skipped. */
+export Diag[] parseWire(string wire) {
+  Vec<Diag> out = Vec.create();
+  i32 start = 0;
+  u8[] b = wire.toBytes();
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i < b.len() && b[i] != '\n') { continue; }
+    string line = wire.slice(start, i);
+    start = i + 1;
+    string[] f = fields(line);
+    if (f.len() < 5) { continue; }
+    i32 width = f.len() > 7 ? number(f[7]) : 1;
+    out.push(Diag(f[0], number(f[1]) < 1 ? 1 : number(f[1]), number(f[2]) < 1 ? 1 : number(f[2]), f[4],
+                  f.len() > 5 ? f[5] : "", f.len() > 6 ? f[6] : "", width < 1 ? 1 : width,
+                  f.len() > 8 && f[8] == "warning"));
+  }
+  return out.toArray();
+}
+
+/** The diagnostics in `file`. */
+export Diag[] inFile(Diag[] all, string file) {
+  Vec<Diag> out = Vec.create();
+  for (i32 i = 0; i < all.len(); i++) { if (all[i].file == file) { out.push(all[i]); } }
+  return out.toArray();
+}
+
+export i32 errorCount(Diag[] ds) {
+  i32 n = 0;
+  for (i32 i = 0; i < ds.len(); i++) { if (!ds[i].warning) { n++; } }
+  return n;
+}

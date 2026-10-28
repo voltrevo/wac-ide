@@ -1,0 +1,373 @@
+// `wac.json5` — the project manifest, and the mapping table it declares.
+//
+// `design/lang/0009` D6, D9. A project is a directory with a `wac.json5`; an empty one is valid.
+// The field this reads is `imports`, a table from a *mapping name* to where its modules come from:
+//
+//     {
+//       imports: {
+//         bits: { git: 'https://example.invalid/bits', ref: 'main' },
+//         acme: { git: 'https://example.invalid/acme', ref: 'v1', subdir: 'packages/acme' },
+//       },
+//     }
+//
+// **Reading and checking only.** Nothing here fetches, and nothing here touches a filesystem: it
+// takes the bytes of a manifest and answers with a table or with the first thing wrong with it.
+// Where the bytes came from — and where `wac.json5` was found, which is D7's upward search — is
+// the caller's, because that half needs a capability and this half must stay testable without one.
+//
+// **A key is a complete package name** (spec ch04 `§wac-package-key-exact-rme93fh`): `acme` matches
+// the specifier `acme` and nothing else. There are no prefix mappings, so a key ending in `/` is
+// refused, and a package's modules are reached through the one its own manifest `exports`.
+
+import { JsonValue, JsonObject, JsonMember } from "../../json/src/value.wac";
+import { parseJson5 } from "../../json/src/json.wac";
+
+export i32 M_OK()            { return 0; }
+export i32 M_NOT_JSON5()     { return 1; }   // the bytes are not a JSON5 document
+export i32 M_NOT_OBJECT()    { return 2; }   // the document is not an object
+export i32 M_IMPORTS_KIND()  { return 3; }   // `imports` is present and is not an object
+export i32 M_MAPPING_KIND()  { return 4; }   // a mapping's value is not an object
+export i32 M_NO_GIT()        { return 5; }   // a mapping has no `git`, or it is not a string
+export i32 M_NO_REF()        { return 6; }   // a mapping has no `ref`, or it is not a string
+export i32 M_SUBDIR_KIND()   { return 7; }   // `subdir` is present and is not a string
+export i32 M_EMPTY_NAME()    { return 8; }   // a mapping name is "" or "/"
+export i32 M_PREFIX_KEY()    { return 9; }   // a mapping name ending in `/`: a package is named whole
+export i32 M_SUBDIR_ESCAPE() { return 10; }  // a `subdir` that leaves its own checkout
+export i32 M_RESERVED_NAME()  { return 11; }  // a mapping of `core`, `std`, or anything under them
+export i32 M_EXPORTS_KIND()   { return 12; }  // `exports` is present and is not one module path
+export i32 M_PATH_FORM()      { return 13; }  // an `exports`, `subdir` or `check.exclude` not beginning with `./`
+export i32 M_CHECK_KIND()     { return 14; }  // `check` is not an object, or its `exclude` not a list of strings
+
+/**
+ * What a code means, as a sentence for somebody who has to act on it.
+ *
+ * Beside the codes rather than at each caller: `wacc` printed only `m.detail` — *`wac.json5` is not
+ * usable: std/* — which names the mapping and not the complaint, so the reader knows which line and
+ * not what is wrong with it. One renderer means every reader says the same thing.
+ */
+export string manifestWhy(i32 code) {
+  if (code == M_NOT_JSON5())     { return "it is not a JSON5 document"; }
+  if (code == M_NOT_OBJECT())    { return "the document is not an object"; }
+  if (code == M_IMPORTS_KIND())  { return "`imports` is not an object"; }
+  if (code == M_MAPPING_KIND())  { return "a mapping is not an object"; }
+  if (code == M_NO_GIT())        { return "a mapping has no `git` string"; }
+  if (code == M_NO_REF())        { return "a mapping has no `ref` string"; }
+  if (code == M_SUBDIR_KIND())   { return "`subdir` is not a string"; }
+  if (code == M_EMPTY_NAME())    { return "a mapping name is empty"; }
+  if (code == M_PREFIX_KEY())    { return "a mapping name ends in `/`, and a package is named whole — there are no prefix mappings"; }
+  if (code == M_SUBDIR_ESCAPE()) { return "a `subdir` leaves its own checkout"; }
+  if (code == M_EXPORTS_KIND())  { return "`exports` is not one module path"; }
+  if (code == M_PATH_FORM())     { return "a path in wac.json5 must begin with `./`"; }
+  if (code == M_CHECK_KIND())    { return "`check` is an object whose `exclude` is a list of `./` patterns"; }
+  if (code == M_RESERVED_NAME()) {
+    return "`core` and `std` are the toolchain's own and cannot be mapped";
+  }
+  return "it is not valid";
+}
+
+/**
+ * Whether a mapping name is one the toolchain keeps — `design/lang/0009` D4.
+ *
+ * `core` and `std` themselves, and anything beneath them. `core/` and `std/` are the prefix
+ * spellings of the same two. Matching is exact and case-sensitive, so `stdlib`, `corelib`, `mystd`
+ * and `Core` are somebody else's names and stay theirs.
+ */
+export bool isReservedName(string name) {
+  string[] roots = ["core", "std"];
+  for (string r in roots) {
+    if (name == r || name == "\{r}/") { return true; }
+    if (name.len() > r.len() + 1 && name.slice(0, r.len() + 1) == "\{r}/") { return true; }
+  }
+  return false;
+}
+
+/** One entry of the `imports` table. */
+export struct Mapping {
+  string name;      // the package name, exactly as written
+  string git;
+  string ref;
+  string subdir;    // the package's directory in the checkout; "" when it is the repository's root
+}
+
+/**
+ * A manifest, or the first thing wrong with it.
+ *
+ * One failure rather than a list, and deliberately: the checks are ordered so that a later one
+ * cannot be reached with an earlier one outstanding, so a list would be a list of consequences.
+ * `detail` names the mapping or field the code is about, because "two names overlap" without
+ * saying which two is a message that sends you to read the file yourself.
+ */
+export struct Manifest {
+  bool ok;
+  i32 code;
+  string detail;
+  Mapping[] imports;
+  /**
+   * The module importers of this project get — spec ch04 `§wac-package-exports-qwtdfg5` — as
+   * written, relative to the manifest's directory; `""` when the manifest names none.
+   */
+  string exports;
+  /**
+   * `check.exclude` — patterns of files `wac check` does not discover in this project (spec ch06
+   * `§wac-check-exclude-2ixx2cu`), each written with its `./`.
+   */
+  string[] checkExclude;
+}
+
+Manifest failed(i32 code, string detail) { return Manifest(false, code, detail, Mapping[](), "", string[]()); }
+
+/** The manifest in `src`, checked. An empty document — or one with no `imports` — is valid. */
+export Manifest readManifest(u8[] src) {
+  JsonObject? top = null;
+  match (parseJson5(src)) {
+    Ok(doc): { top = doc.object(); }
+    // The detail says where: `unexpected at byte 41` is the line to look at.
+    Err(e): { return failed(M_NOT_JSON5(), e.text()); }
+  }
+  if (top is null) { return failed(M_NOT_OBJECT(), ""); }
+  JsonObject root = top!;
+
+  // One module path and nothing else: a map of entry points is refused (`§wac-package-exports-single-c3mtr3y`).
+  string exports = "";
+  JsonValue? exportsVal = root.getStr("exports");
+  if (exportsVal is not null) {
+    match (exportsVal!) {
+      Str(bytes): { exports = string.fromBytes(bytes); }
+      default: { return failed(M_EXPORTS_KIND(), "exports"); }
+    }
+    if (exports == "") { return failed(M_EXPORTS_KIND(), "exports"); }
+    // **Explicitly relative** (spec ch04 `§wac-manifest-dot-slash-p59q7q3`), which also keeps an
+    // absolute path from being read as one inside the package.
+    if (!startsWithDotSlash(exports)) { return failed(M_PATH_FORM(), "exports"); }
+  }
+
+  // **What `wac check` leaves undiscovered** — every pattern explicitly relative
+  // (`§wac-check-exclude-dot-slash-yfwkbsg`), for the reason `exports` is.
+  string[] exclude = string[]();
+  JsonValue? checkVal = root.getStr("check");
+  if (checkVal is not null) {
+    match (checkVal!) {
+      Object(co): {
+        JsonValue? ex = co.getStr("exclude");
+        if (ex is not null) {
+          match (ex!) {
+            Array(items): {
+              exclude = string[].filled(items.len(), "");
+              for (i32 i = 0; i < items.len(); i++) {
+                match (items.get(i)) {
+                  Str(bytes): { exclude[i] = string.fromBytes(bytes); }
+                  default: { return failed(M_CHECK_KIND(), "check.exclude"); }
+                }
+                if (!startsWithDotSlash(exclude[i])) { return failed(M_PATH_FORM(), "check.exclude"); }
+              }
+            }
+            default: { return failed(M_CHECK_KIND(), "check.exclude"); }
+          }
+        }
+      }
+      default: { return failed(M_CHECK_KIND(), "check"); }
+    }
+  }
+
+  JsonValue? importsVal = root.getStr("imports");
+  if (importsVal is null) { return Manifest(true, M_OK(), "", Mapping[](), exports, exclude); }
+
+  JsonObject table = JsonObject.create();
+  match (importsVal!) {
+    Object(o): { table = o; }
+    default: { return failed(M_IMPORTS_KIND(), "imports"); }
+  }
+
+  Mapping[] out = Mapping[].defaulted(table.count);
+  for (i32 i = 0; i < table.count; i++) {
+    JsonMember m = table.at(i);
+    string name = m.keyStr();
+    if (name == "" || name == "/") { return failed(M_EMPTY_NAME(), name); }
+    if (endsWithSlash(name)) { return failed(M_PREFIX_KEY(), name); }
+    // **`core` and `std` are the toolchain's, and D4 says so** — reserved, never remapped, never in
+    // a lockfile. Refused here because it is a fact about the manifest: the person who wrote the
+    // mapping is told once, at the line they wrote, rather than once per import that hits it.
+    //
+    // The **prefix** is what is reserved, not the set of files that happen to exist. The rule used
+    // to be "is this the name of a built-in file", which protected `std/platform.wac` because that
+    // file is there and nothing else — so `std/` was mapped and consulted for every other name.
+    // `issues/lang/0167a`. `stdlib/` and `corelib/` are ordinary names and stay ordinary.
+    if (isReservedName(name)) { return failed(M_RESERVED_NAME(), name); }
+
+    JsonObject entry = JsonObject.create();
+    match (m.value) {
+      Object(o): { entry = o; }
+      default: { return failed(M_MAPPING_KIND(), name); }
+    }
+
+    Field git = stringField(entry, "git");
+    if (!git.ok) { return failed(M_NO_GIT(), name); }
+    Field ref = stringField(entry, "ref");
+    if (!ref.ok) { return failed(M_NO_REF(), name); }
+
+    string subdir = "";
+    JsonValue? sub = entry.getStr("subdir");
+    if (sub is not null) {
+      match (sub!) {
+        Str(bytes): { subdir = string.fromBytes(bytes); }
+        default: { return failed(M_SUBDIR_KIND(), name); }
+      }
+      if (!startsWithDotSlash(subdir)) { return failed(M_PATH_FORM(), name); }
+      if (escapes(subdir)) { return failed(M_SUBDIR_ESCAPE(), name); }
+    }
+
+    out[i] = Mapping(name, git.value, ref.value, subdir);
+  }
+  return Manifest(true, M_OK(), "", out, exports, exclude);
+}
+
+/** A member that has to be a string. A struct rather than an out-parameter: a `string` is a value
+ * here, so a callee assigning to its own parameter would be writing to nothing. */
+struct Field {
+  bool ok;
+  string value;
+}
+
+Field stringField(JsonObject o, string key) {
+  JsonValue? v = o.getStr(key);
+  if (v is null) { return Field(false, ""); }
+  match (v!) {
+    Str(bytes): { return Field(true, string.fromBytes(bytes)); }
+    default: { return Field(false, ""); }
+  }
+}
+
+bool startsWithDotSlash(string s) { return s.len() >= 2 && s.slice(0, 2) == "./"; }
+
+bool endsWithSlash(string s) {
+  return s.len() > 0 && s.slice(s.len() - 1, s.len()) == "/";
+}
+
+/**
+ * Whether a `subdir` leaves the checkout it is relative to.
+ *
+ * Checked on the written text rather than after normalising, because `a/../..` normalises to `..`
+ * and `../a` does not — but both are the same mistake and the second is the one a normaliser is
+ * tempted to keep. Any `..` component at all is refused; a mapping has no reason for one.
+ */
+bool escapes(string s) {
+  // No leading-`/` case: every path reaching here began with `./` or was normalised, which drops one.
+  i32 start = 0;
+  for (i32 i = 0; i <= s.len(); i++) {
+    bool end = i == s.len();
+    if (!end && s.slice(i, i + 1) != "/") { continue; }
+    if (s.slice(start, i) == "..") { return true; }
+    start = i + 1;
+  }
+  return false;
+}
+
+/**
+ * Whether this toolchain can fetch `git`, and if not, what to tell the person.
+ *
+ * **Not part of `readManifest`, on purpose.** Which transports exist is a property of the
+ * *toolchain*, not of the file format: `packages/git`'s `parseRemote` takes `https` and nothing
+ * else today, and `design/lang/0009` D11 scopes the first implementation to public repositories
+ * over HTTPS with SSH and registries explicitly out. A build that later grows SSH should not need
+ * the manifest reader changed, and a manifest written for such a build should not be *invalid* —
+ * it should be unsupported *here*, which is a different sentence.
+ *
+ * Called by whatever is about to fetch, so the refusal arrives before the network rather than as
+ * a transport error three layers down naming a URL the person did not think they had typed.
+ * Empty when it is fine.
+ */
+export string unsupportedTransport(string git) {
+  if (git == "") { return "no `git` url"; }
+  i32 scheme = git.indexOf("://");
+  if (scheme < 0) {
+    // `git@host:path` is the shape that gets typed from muscle memory, and it has no `://` at all.
+    return git.indexOf("@") >= 0
+      ? "`\{git}` looks like an SSH remote; this toolchain fetches over HTTPS only"
+      : "`\{git}` has no scheme; a `git` url must start with `https://`";
+  }
+  string s = git.slice(0, scheme);
+  if (s == "https") { return ""; }
+  if (s == "http") {
+    return "`\{git}` is plain HTTP; a dependency is fetched over HTTPS so that what arrives "
+           + "is what the host sent";
+  }
+  return "`\{s}://` is not a transport this toolchain has; HTTPS only";
+}
+
+/** Which mapping a specifier names. */
+export struct Match {
+  bool found;
+  i32 index;        // into the manifest's `imports`
+}
+
+/** The mapping `spec` names, if any: the one whose name is the whole specifier (spec ch04). */
+export Match matchSpecifier(Manifest m, string spec) {
+  for (i32 i = 0; i < m.imports.len(); i++) {
+    if (spec == m.imports[i].name) { return Match(true, i); }
+  }
+  return Match(false, -1);
+}
+
+/** Where a package's directory, or its entry module, is inside its repository — or why nowhere. */
+export struct Located {
+  bool ok;
+  i32 code;         // M_OK, or M_SUBDIR_ESCAPE when a path climbs out
+  string path;      // repository-relative, normalised, no leading slash; "" for the root itself
+}
+
+/**
+ * The package directory a `Match` names: the mapping's `subdir`, or the repository's root (spec
+ * ch04 `§wac-package-subdir-p3gfzri`). What is imported from it is the module that directory's own
+ * manifest `exports` — `packageEntry` — and never a file the specifier names.
+ */
+export Located locate(Manifest m, Match hit) {
+  if (!hit.found) { return Located(false, M_OK(), ""); }
+  string path = normalise(m.imports[hit.index].subdir);
+  if (escapes(path)) { return Located(false, M_SUBDIR_ESCAPE(), ""); }
+  return Located(true, M_OK(), path);
+}
+
+/**
+ * The entry module of a package whose directory is `dir` and whose manifest says `exports` — spec
+ * ch04 `§wac-package-exports-qwtdfg5`. Refused when `exports` leaves the package's directory, since
+ * then the package would be offering a file that is not its own.
+ */
+export Located packageEntry(string dir, string exports) {
+  string inner = normalise(exports);
+  if (inner == "" || escapes(inner)) { return Located(false, M_SUBDIR_ESCAPE(), ""); }
+  return Located(true, M_OK(), dir == "" ? inner : "\{dir}/\{inner}");
+}
+
+/**
+ * `.` and `..` collapsed, for a repository-relative path.
+ *
+ * A local copy rather than `packages/wacc/src/files.wac`'s: that one keeps a leading `/` because an
+ * absolute path is a real thing on a filesystem, and here there is no such thing — everything is
+ * relative to a checkout root, so a leading slash is one of the ways out this refuses. A `..` that
+ * cannot be cancelled is kept rather than dropped, so the caller's second `escapes` check sees it.
+ */
+string normalise(string path) {
+  // **Sized from what fills it.** A fixed bound here would need an "or else" for a path deeper
+  // than the bound, and every honest answer to that is worse than not having the case: silently
+  // dropping components produces a *wrong* path from a confinement check, and trapping turns a
+  // strange import into a dead compiler. A path has at most one more component than it has
+  // slashes, so the array cannot overflow and there is no branch to get wrong.
+  i32 slashes = 0;
+  for (i32 i = 0; i < path.len(); i++) { if (path.slice(i, i + 1) == "/") { slashes = slashes + 1; } }
+  string[] parts = string[].filled(slashes + 1, "");
+  i32 n = 0;
+  i32 start = 0;
+  for (i32 i = 0; i <= path.len(); i++) {
+    bool end = i == path.len();
+    if (!end && path.slice(i, i + 1) != "/") { continue; }
+    string part = path.slice(start, i);
+    start = i + 1;
+    if (part == "" || part == ".") { continue; }
+    if (part == ".." && n > 0 && parts[n - 1] != "..") { n = n - 1; continue; }
+    parts[n] = part;
+    n = n + 1;
+  }
+  string out = "";
+  for (i32 i = 0; i < n; i++) { out = out + (i > 0 ? "/" : "") + parts[i]; }
+  return out;
+}

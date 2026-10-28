@@ -1,0 +1,2 @@
+/** Twice `x`. */
+export i32 double(i32 x) { return x * 2; }

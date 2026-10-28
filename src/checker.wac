@@ -1,0 +1,279 @@
+// The checker: wac's compiler, kept warm in a process of its own.
+//
+// **Why a process.** Checking a file of the wac repository takes from a tenth of a second to several,
+// and a page's program is one thread: checked there, typing would stop until the check did. So the page
+// starts a copy of itself (`--spawn checker`, `export async i32 checker(Sys sys)` in ide.wac) and talks to
+// it over its standard input and output.
+//
+// **Why it stays.** Most of a big check is reading files out of the browser's storage — two of every five
+// seconds for the `wac` command's 236 files. The checker keeps every file it has read (the `wac`
+// command's own `ReadCache`), and the editor sends it each edit as it happens, so after the first check
+// nothing is read again, and what is checked is what is on screen, saved or not.
+//
+// **The conversation**, one message after another on each side:
+//
+//     page → checker   put\t<path>\t<n>\n<n bytes>     a file's contents now, saved or not
+//                      forget\t<path>\n                a file is gone, or should be read again
+//                      reset\n                         forget everything (a manifest changed)
+//                      check\t<id>\t<entry>\n          check what <entry> reaches
+//                      build\t<id>\t<entry>\n          compile <entry> to a module
+//     checker → page   <kind>\t<id>\t<files>\t<ms>\t<n>\n<n bytes>
+//
+// where the answer's kind is `check` (the bytes are the diagnostics wire), `wasm` (a module) or `error`
+// (why there is neither). A page opened from a file cannot start workers from its own, so there the
+// same `Engine` runs inside the page instead — slower to type beside, and otherwise the same.
+
+import { Buf, Map, Ticket, Vec, hashString, stringEq } from "core";
+import { Cli, Core, FileResult, GRANT_READ, HostChild, Sys } from "std";
+import { Fs } from "../vendor/wac/packages/fs/src/fs.wac";
+import { ReadCache, Sources, exactly, gatherNeeded, gatherWith, resOf } from "../vendor/wac/packages/wac/src/sources.wac";
+import { blockedFilesIn, diagnoseGraphIn, emitFilesIn } from "../vendor/wac/packages/wacc/src/api.wac";
+
+/** What a check or a build came to. */
+export struct Outcome {
+  /** "check", "wasm" or "error". */
+  string kind;
+  i32 id;
+  /** How many files the program is made of. */
+  i32 files;
+  i32 ms;
+  u8[] bytes;
+}
+
+// ── the engine: the same in the checker's process and, as a fallback, in the page ──
+
+export struct Engine {
+  Fs fs;
+  Cli cli;
+  Core core;
+  ReadCache cache;
+
+  Engine create(Fs fs, Cli cli, Core core) { return Engine(fs, cli, core, ReadCache.create()); }
+
+  void put(this, string path, u8[] bytes) {
+    this.cache.files.set(path, FileResult.of(true, bytes, "", 0));
+    this.cache.texts.remove(path);
+    this.cache.specs.remove(path);
+  }
+
+  void forget(this, string path) {
+    this.cache.files.remove(path);
+    this.cache.texts.remove(path);
+    this.cache.specs.remove(path);
+  }
+
+  void reset(this) { this.cache = ReadCache.create(); }
+
+  async Outcome run(this, string kind, i32 id, string entry) {
+    i64 t0 = this.core.nowMillis().wait();
+    bool build = kind == "build";
+    Sources s = build ? await gatherNeeded(this.fs, this.cli, entry, this.cache)
+                      : await gatherWith(this.fs, this.cli, entry, false, this.cache);
+    i32 ms = (this.core.nowMillis().wait() - t0) as! i32;
+    if (s.missing != "" || s.why != "") {
+      return Outcome("error", id, s.n, ms, (s.why != "" ? s.why : "cannot read \{s.missing}").toBytes());
+    }
+    string[] paths = exactly(s.paths, s.n);
+    string[] texts = exactly(s.texts, s.n);
+    if (!build) {
+      string wire = diagnoseGraphIn(paths, texts, resOf(s), entry);
+      return Outcome("check", id, s.n, (this.core.nowMillis().wait() - t0) as! i32, wire.toBytes());
+    }
+    u8[] wasm = emitFilesIn(paths, texts, resOf(s), entry);
+    i32 total = (this.core.nowMillis().wait() - t0) as! i32;
+    if (wasm.len() == 0) {
+      string why = blockedFilesIn(paths, texts, resOf(s), entry);
+      if (why == "") {
+        why = diagnoseGraphIn(paths, texts, resOf(s), entry) != "" ? "it has errors — see Problems" : "the compiler made nothing";
+      }
+      return Outcome("error", id, s.n, total, why.toBytes());
+    }
+    return Outcome("wasm", id, s.n, total, wasm);
+  }
+}
+
+// ── bytes in, a message at a time ──
+
+/** What has arrived and not been read: lines, and runs of a known length. */
+export struct Inbox {
+  u8[] data;
+  i32 at;
+
+  Inbox create() { return Inbox(u8[](), 0); }
+
+  void add(this, u8[] more) {
+    u8[] next = u8[].filled(this.data.len() - this.at + more.len(), 0 as u8);
+    i32 k = 0;
+    for (i32 i = this.at; i < this.data.len(); i++) { next[k] = this.data[i]; k++; }
+    for (i32 i = 0; i < more.len(); i++) { next[k] = more[i]; k++; }
+    this.data = next;
+    this.at = 0;
+  }
+
+  /** The next line without its newline, if a whole one has arrived. */
+  string? line(this) {
+    for (i32 i = this.at; i < this.data.len(); i++) {
+      if (this.data[i] == '\n') {
+        u8[] out = u8[].filled(i - this.at, 0 as u8);
+        for (i32 k = this.at; k < i; k++) { out[k - this.at] = this.data[k]; }
+        this.at = i + 1;
+        return string.fromBytes(out);
+      }
+    }
+    return null;
+  }
+
+  /** The next `n` bytes, if they have all arrived. */
+  u8[]? take(this, i32 n) {
+    if (this.data.len() - this.at < n) { return null; }
+    u8[] out = u8[].filled(n, 0 as u8);
+    for (i32 k = 0; k < n; k++) { out[k] = this.data[this.at + k]; }
+    this.at = this.at + n;
+    return out;
+  }
+}
+
+export string[] tabbed(string line) {
+  Vec<string> out = Vec.create();
+  i32 start = 0;
+  u8[] b = line.toBytes();
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '\t') { out.push(line.slice(start, i)); start = i + 1; }
+  }
+  return out.toArray();
+}
+
+export i32 num(string s) {
+  i32 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] >= '0' && b[i] <= '9') { n = n * 10 + ((b[i] - '0') as i32); } }
+  return n;
+}
+
+export u8[] framed(Outcome o) {
+  u8[] head = "\{o.kind}\t\{o.id}\t\{o.files}\t\{o.ms}\t\{o.bytes.len()}\n".toBytes();
+  u8[] out = u8[].filled(head.len() + o.bytes.len(), 0 as u8);
+  for (i32 i = 0; i < head.len(); i++) { out[i] = head[i]; }
+  for (i32 i = 0; i < o.bytes.len(); i++) { out[head.len() + i] = o.bytes[i]; }
+  return out;
+}
+
+export u8[] putMessage(string path, u8[] bytes) {
+  u8[] head = "put\t\{path}\t\{bytes.len()}\n".toBytes();
+  u8[] out = u8[].filled(head.len() + bytes.len(), 0 as u8);
+  for (i32 i = 0; i < head.len(); i++) { out[i] = head[i]; }
+  for (i32 i = 0; i < bytes.len(); i++) { out[head.len() + i] = bytes[i]; }
+  return out;
+}
+
+/** The checker's process: messages in, answers out, until its input ends. */
+export async i32 serve(Sys sys) {
+  Engine e = Engine.create(Fs.onHost(sys.cli, 0), sys.cli, sys.core);
+  Inbox in = Inbox.create();
+  while (true) {
+    string? line = in.line();
+    if (line is null) {
+      match (await sys.cli.readChunk().ticket()) {
+        Data(b): { in.add(b); }
+        End: { return 0; }
+        Failed(why): { return 1; }
+      }
+      continue;
+    }
+    string[] f = tabbed(line!);
+    if (f[0] == "put" && f.len() >= 3) {
+      u8[]? body = in.take(num(f[2]));
+      while (body is null) {
+        match (await sys.cli.readChunk().ticket()) {
+          Data(b): { in.add(b); }
+          End: { return 0; }
+          Failed(why): { return 1; }
+        }
+        body = in.take(num(f[2]));
+      }
+      e.put(f[1], body!);
+    } else if (f[0] == "forget" && f.len() >= 2) {
+      e.forget(f[1]);
+    } else if (f[0] == "reset") {
+      e.reset();
+    } else if ((f[0] == "check" || f[0] == "build") && f.len() >= 3) {
+      sys.cli.write(framed(await e.run(f[0], num(f[1]), f[2])));
+    }
+  }
+}
+
+// ── the page's side ──
+
+export struct Checker {
+  /** The process, when there is one; null when the engine runs in the page instead. */
+  HostChild? kid;
+  Engine? local;
+  Cli cli;
+  Inbox in;
+  i32 nextId;
+  string note;
+
+  /**
+   * Start a checker process — or, where the page cannot, an engine in the page over `fs`. `spawn` false
+   * is a page opened from a file: there a worker cannot start one of its own, and asking never answers
+   * (the browser's refusal is thrown inside the host), so it is not asked.
+   */
+  async Checker start(Fs fs, Cli cli, Core core, bool spawn) {
+    string why = "a page opened from a file cannot start a process";
+    if (spawn) {
+      HostChild k = await cli.spawnSelf([("checker").toBytes()], GRANT_READ, "", 0, false).ticket();
+      if (k.handle >= 0) { return Checker(k, null, cli, Inbox.create(), 1, ""); }
+      why = k.error;
+    }
+    return Checker(null, Engine.create(fs, cli, core), cli, Inbox.create(), 1,
+                   "Checking runs in the page here (\{why}), so typing may pause while it does.");
+  }
+
+  /** A file's contents now: what the next check sees, saved or not. */
+  void put(this, string path, u8[] bytes) {
+    if (this.local is not null) { this.local!.put(path, bytes); return; }
+    this.cli.send(this.kid!.handle, putMessage(path, bytes));
+  }
+
+  void forget(this, string path) {
+    if (this.local is not null) { this.local!.forget(path); return; }
+    this.cli.send(this.kid!.handle, "forget\t\{path}\n".toBytes());
+  }
+
+  void reset(this) {
+    if (this.local is not null) { this.local!.reset(); return; }
+    this.cli.send(this.kid!.handle, "reset\n".toBytes());
+  }
+
+  /** Check — or with `kind` "build", compile — `entry`. One at a time: the caller waits for each. */
+  async Outcome run(this, string kind, string entry) {
+    i32 id = this.nextId;
+    this.nextId++;
+    if (this.local is not null) { return await this.local!.run(kind, id, entry); }
+    await this.cli.send(this.kid!.handle, "\{kind}\t\{id}\t\{entry}\n".toBytes()).ticket();
+    while (true) {
+      string? head = this.in.line();
+      if (head is not null) {
+        string[] f = tabbed(head!);
+        if (f.len() >= 5) {
+          u8[]? body = this.in.take(num(f[4]));
+          while (body is null) {
+            if (!(await this.more())) { return Outcome("error", id, 0, 0, "the checker stopped".toBytes()); }
+            body = this.in.take(num(f[4]));
+          }
+          if (num(f[1]) == id) { return Outcome(f[0], id, num(f[2]), num(f[3]), body!); }
+        }
+        continue;
+      }
+      if (!(await this.more())) { return Outcome("error", id, 0, 0, "the checker stopped".toBytes()); }
+    }
+  }
+
+  async bool more(this) {
+    match (await this.cli.recv(this.kid!.handle).ticket()) {
+      Data(b): { this.in.add(b); return true; }
+      End: { return false; }
+      Failed(why): { return false; }
+    }
+  }
+}

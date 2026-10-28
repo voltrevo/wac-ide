@@ -1,0 +1,1448 @@
+// The wac lexer, in wac. Port of compiler/wacLex.ts.
+//
+// Differences from the reference, both deliberate:
+//
+// A token holds a byte *span* into the source rather than its text. The reference
+// stores `text: string`; spans are cheaper and are what real compilers keep. Three
+// kinds have text that is computed rather than copied — string literals (the
+// reference stores the unescaped value), character literals (stored as the decimal
+// codepoint) and nothing else — so a consumer that wants the value calls
+// `tokenString` or `tokenCodepoint` rather than reading the span directly.
+//
+// Columns count UTF-16 code units, not bytes, so that positions match the reference
+// exactly on non-ASCII lines. `advance` does the accounting: a continuation byte
+// adds nothing, a 4-byte sequence adds two (it is a surrogate pair in UTF-16), and
+// everything else adds one.
+
+import { isLiteralChar } from "./litchars.wac";
+import {
+  kInt, kFloat, kString, kIdent, kEof,
+  kImport, kExport, kStruct, kConst, kThis, kOverride,
+  kIf, kElse, kWhile, kFor, kDo, kSwitch, kCase, kDefault,
+  kBreak, kContinue, kReturn, kTrap, kTrue, kFalse, kNull,
+  kIs, kNot, kAs, kVoid, kFn, kEnum, kMatch, kAsync, kAwait, kStatic, kPrivate, kDefer, kMatches,
+  kAsBang, kAsTilde, kAsAt,
+  kPlus, kMinus, kStar, kSlash, kPercent, kAssign, kEq, kNe,
+  kLt, kLe, kGt, kGe, kAndAnd, kOrOr, kBang, kAnd, kOr, kCaret, kTilde,
+  kShl, kShr, kShrU,
+  kPlusEq, kMinusEq, kStarEq, kSlashEq, kPercentEq,
+  kAndEq, kOrEq, kCaretEq, kShlEq, kShrEq, kShrUEq,
+  kInc, kDec,
+  kLparen, kRparen, kLbrace, kRbrace, kLbrack, kRbrack,
+  kSemi, kColon, kComma, kDot, kQuestion, kAt, kQuestionDot,
+  kJsxText, kFatArrow,
+} from "./kinds.wac";
+
+// ── Output ────────────────────────────────────────────────────────────────────
+//
+// Tokens come back as a flat i32 array of (kind, start, len, line, col) and errors
+// as (code, line, col). Not because that is nicer — a `Token[]` would be.
+//
+// **The reason here said "wac has no generics" and that is wrong.** What is true is narrower and is a
+// *package* rule rather than a language one: `packages/wacc` has no dependencies, because the top rung
+// of the ladder has to read its whole graph, so `core/vec.wac` is out — because of the lambda in
+// `Vec.fold` rather than anything about generics.
+//
+// The other reason stands on its own and is the one that decides it: **flat means no growth at
+// all.** A source of n bytes cannot produce more than n tokens, so the arrays are sized once from
+// the input and a growable container would buy nothing.
+
+export i32 tokenStride() { return 5; }   // kind, start, len, line, col
+export i32 errorStride() { return 3; }   // code, line, col
+
+export struct Lexed {
+  i32[] tokens;
+  i32 tokenCount;      // tokens, not i32s
+  i32[] errors;
+  i32 errorCount;
+  /** `kSymName` tokens the parser appended after the end of the file — see `P.symNameTok`. */
+  i32 synthCount;
+  /**
+   * **Set once these tokens have been parsed, because parsing consumes them.**
+   *
+   * `splitGt` in the parser rewrites a `>>` in the array to a `>` when it closes two type-argument
+   * lists — `Vec<Vec<i32>>` — so the array a second parse would read is not the one the lexer
+   * produced, and `Vec<Vec<i32>` is a comparison rather than a type. Nothing does this today, and
+   * that is exactly why nothing would have caught it: `parseProgram` traps on the second call
+   * rather than answering differently. Lex again for a second parse. `issues/lang/0278a`.
+   */
+  bool parsed;
+}
+
+// Error codes rather than messages: a message would mean building a string per
+// error, and the consumer renders these anyway.
+export i32 errUnexpectedChar()      { return 1; }
+export i32 errUnterminatedString()  { return 2; }
+export i32 errUnknownEscape()       { return 3; }
+export i32 errUnterminatedComment() { return 4; }
+export i32 errUnterminatedChar()    { return 5; }
+export i32 errEmptyChar()           { return 6; }
+export i32 errCharTooLong()         { return 7; }
+export i32 errBadUnicodeEscape()    { return 8; }
+export i32 errRawCharacter()        { return 9; }
+export i32 errBlockStringOpen()     { return 10; }
+/**
+ * `\{` in a block string — `design/lang/0013` D7.
+ *
+ * Its own code rather than `errUnknownEscape`, because since a one-line literal interpolates, the
+ * reader who writes this has learned a rule and is applying it one place it does not hold. *Unknown
+ * escape* is true and sends them looking for a typo.
+ */
+export i32 errBlockInterp()         { return 11; }
+/** `@""`, or a `@"…` the line ends inside — a verbatim name holds some text, on one line. */
+export i32 errVerbatimName()        { return 12; }
+/** `"a\{}b"` — an interpolation with nothing in it, which would otherwise be reported as `()`. */
+export i32 errEmptyInterp()         { return 13; }
+/** `0x` with no hex digit after it — the grammar's `"0x" , hex , {hex | "_"}` wants at least one. */
+export i32 errHexDigits()           { return 14; }
+
+// ── Character classification ──────────────────────────────────────────────────
+//
+// Bytes, not codepoints: every character wac's grammar cares about is ASCII, and a
+// non-ASCII byte can only appear inside a string, a comment or an error.
+
+bool isDigit(i32 c)  { return c >= '0' && c <= '9'; }
+bool isHexDigit(i32 c) {
+  return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+bool isIdentStart(i32 c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+bool isIdentPart(i32 c) { return isIdentStart(c) || isDigit(c); }
+bool isSpace(i32 c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+// Keyword matching by packing the span into an i64 and comparing integers.
+//
+// Comparing against a `string` literal is now possible — `string.toBytes` landed
+// mid-write — but it allocates a byte array per candidate, and this runs once per
+// identifier in the source. Packing is allocation free and every wac keyword is
+// 8 bytes or fewer, so each fits an i64 exactly.
+//
+// (Indexing a string still yields a one-character *string*, not a byte, so the
+// direct `src[i] != want[i]` comparison remains unavailable.)
+
+i64 packSpan(u8[] src, i32 start, i32 len) {
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < len; i++) {
+    v = (v << 8) | (src[start + i] as i64);
+  }
+  return v;
+}
+
+i64 p2(i32 a, i32 b) { return ((a as i64) << 8) | (b as i64); }
+i64 p3(i32 a, i32 b, i32 c) { return (p2(a, b) << 8) | (c as i64); }
+i64 p4(i32 a, i32 b, i32 c, i32 d) { return (p3(a, b, c) << 8) | (d as i64); }
+i64 p5(i32 a, i32 b, i32 c, i32 d, i32 e) { return (p4(a, b, c, d) << 8) | (e as i64); }
+i64 p6(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f) {
+  return (p5(a, b, c, d, e) << 8) | (f as i64);
+}
+i64 p7(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f, i32 g) {
+  return (p6(a, b, c, d, e, f) << 8) | (g as i64);
+}
+i64 p8(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f, i32 g, i32 h) {
+  return (p7(a, b, c, d, e, f, g) << 8) | (h as i64);
+}
+
+/** The keyword kind for an identifier span, or `kIdent` if it is not a keyword. */
+i32 keywordKind(u8[] src, i32 start, i32 len) {
+  if (len < 2 || len > 8) { return kIdent(); }
+  i64 v = packSpan(src, start, len);
+
+  if (len == 2) {
+    if (v == p2('i', 'f')) { return kIf(); }
+    if (v == p2('d', 'o')) { return kDo(); }
+    if (v == p2('i', 's')) { return kIs(); }
+    if (v == p2('a', 's')) { return kAs(); }
+    if (v == p2('f', 'n')) { return kFn(); }
+    return kIdent();
+  }
+  if (len == 3) {
+    if (v == p3('f', 'o', 'r')) { return kFor(); }
+    if (v == p3('n', 'o', 't')) { return kNot(); }
+    return kIdent();
+  }
+  if (len == 4) {
+    if (v == p4('e', 'l', 's', 'e')) { return kElse(); }
+    if (v == p4('c', 'a', 's', 'e')) { return kCase(); }
+    if (v == p4('t', 'r', 'u', 'e')) { return kTrue(); }
+    if (v == p4('n', 'u', 'l', 'l')) { return kNull(); }
+    if (v == p4('v', 'o', 'i', 'd')) { return kVoid(); }
+    if (v == p4('t', 'h', 'i', 's')) { return kThis(); }
+    if (v == p4('t', 'r', 'a', 'p')) { return kTrap(); }
+    if (v == p4('e', 'n', 'u', 'm')) { return kEnum(); }
+    return kIdent();
+  }
+  if (len == 5) {
+    if (v == p5('w', 'h', 'i', 'l', 'e')) { return kWhile(); }
+    if (v == p5('d', 'e', 'f', 'e', 'r')) { return kDefer(); }
+    if (v == p5('b', 'r', 'e', 'a', 'k')) { return kBreak(); }
+    if (v == p5('f', 'a', 'l', 's', 'e')) { return kFalse(); }
+    if (v == p5('c', 'o', 'n', 's', 't')) { return kConst(); }
+    if (v == p5('m', 'a', 't', 'c', 'h')) { return kMatch(); }
+    if (v == p5('a', 's', 'y', 'n', 'c')) { return kAsync(); }
+    if (v == p5('a', 'w', 'a', 'i', 't')) { return kAwait(); }
+    return kIdent();
+  }
+  if (len == 6) {
+    if (v == p6('i', 'm', 'p', 'o', 'r', 't')) { return kImport(); }
+    if (v == p6('e', 'x', 'p', 'o', 'r', 't')) { return kExport(); }
+    if (v == p6('s', 't', 'r', 'u', 'c', 't')) { return kStruct(); }
+    if (v == p6('s', 't', 'a', 't', 'i', 'c')) { return kStatic(); }
+    if (v == p6('s', 'w', 'i', 't', 'c', 'h')) { return kSwitch(); }
+    if (v == p6('r', 'e', 't', 'u', 'r', 'n')) { return kReturn(); }
+    return kIdent();
+  }
+  if (len == 7) {
+    if (v == p7('d', 'e', 'f', 'a', 'u', 'l', 't')) { return kDefault(); }
+    if (v == p7('p', 'r', 'i', 'v', 'a', 't', 'e')) { return kPrivate(); }
+    if (v == p7('m', 'a', 't', 'c', 'h', 'e', 's')) { return kMatches(); }
+    return kIdent();
+  }
+  if (v == p8('c', 'o', 'n', 't', 'i', 'n', 'u', 'e')) { return kContinue(); }
+  if (v == p8('o', 'v', 'e', 'r', 'r', 'i', 'd', 'e')) { return kOverride(); }
+  return kIdent();
+}
+
+// ── Lexer ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Lexer state.
+ *
+ * Held in a struct rather than as locals because the reference's closures over
+ * `pos`/`line`/`col` have no equivalent **here**: `packages/wacc` is built by the top rung of the
+ * ladder and cannot use what the rung below cannot read. The language itself has had lambdas since 2026-08-16 and they capture by
+ * reference — `spec/cases/0191` — so this is a constraint on this package rather than on wac, and
+ * the sentence here said the latter.
+ */
+struct Lexer {
+  u8[] src;
+  i32 pos;
+  i32 line;
+  i32 col;
+
+  i32 peek(const this, i32 offset) {
+    i32 at = this.pos + offset;
+    if (at >= this.src.len()) { return -1; }   // -1 rather than 0: NUL is a real byte
+    return this.src[at] as i32;
+  }
+
+  /**
+   * Consume one byte, keeping `line` and `col` right.
+   *
+   * `col` counts UTF-16 code units so positions match the reference: continuation
+   * bytes (0x80..0xBF) add nothing, a 4-byte lead adds two because it becomes a
+   * surrogate pair, and anything else adds one.
+   */
+  i32 advance(this) {
+    i32 c = this.src[this.pos] as i32;
+    this.pos++;
+    if (c == '\n') {
+      this.line++;
+      this.col = 1;
+    } else if (c >= 0x80 && c < 0xC0) {
+      // continuation byte: part of a character already counted
+    } else if (c >= 0xF0) {
+      this.col += 2;
+    } else {
+      this.col++;
+    }
+    return c;
+  }
+
+  bool atEnd(const this) { return this.pos >= this.src.len(); }
+}
+
+// ── Emitting ──────────────────────────────────────────────────────────────────
+//
+// The output arrays are pre-sized and written by index, so these take the Lexed
+// value and mutate it rather than returning a new one.
+
+void pushToken(Lexed out, i32 kind, i32 start, i32 len, i32 line, i32 col) {
+  i32 at = out.tokenCount * tokenStride();
+  // **Grown when full.** The array is sized one token per byte, and an interpolation writes more:
+  // `"\{a}"` is six bytes and seven tokens before its end-of-file, more with each `\{`.
+  if (at + tokenStride() > out.tokens.len()) {
+    i32[] bigger = i32[].filled(out.tokens.len() * 2 + tokenStride() * 16, 0);
+    bigger.copyFrom(out.tokens, 0, 0, out.tokens.len());
+    out.tokens = bigger;
+  }
+  out.tokens[at] = kind;
+  out.tokens[at + 1] = start;
+  out.tokens[at + 2] = len;
+  out.tokens[at + 3] = line;
+  out.tokens[at + 4] = col;
+  out.tokenCount++;
+}
+
+void fail(Lexed out, i32 code, i32 line, i32 col) {
+  i32 at = out.errorCount * errorStride();
+  if (at + errorStride() > out.errors.len()) { return; }   // errors are capped
+  out.errors[at] = code;
+  out.errors[at + 1] = line;
+  out.errors[at + 2] = col;
+  out.errorCount++;
+}
+
+// ── Pieces ────────────────────────────────────────────────────────────────────
+
+void skipSpaceAndComments(Lexer lx, Lexed out) {
+  while (!lx.atEnd()) {
+    i32 c = lx.peek(0);
+    if (isSpace(c)) {
+      lx.advance();
+    } else if (c == '/' && lx.peek(1) == '/') {
+      while (!lx.atEnd() && lx.peek(0) != '\n') { lx.advance(); }
+    } else if (c == '/' && lx.peek(1) == '*') {
+      i32 startLine = lx.line;
+      i32 startCol = lx.col;
+      lx.advance();
+      lx.advance();
+      bool closed = false;
+      while (!lx.atEnd() && !closed) {
+        if (lx.peek(0) == '*' && lx.peek(1) == '/') {
+          lx.advance();
+          lx.advance();
+          closed = true;
+        } else {
+          lx.advance();
+        }
+      }
+      if (!closed) { fail(out, errUnterminatedComment(), startLine, startCol); }
+    } else {
+      return;
+    }
+  }
+}
+
+/**
+ * What may follow a backslash, in each of the two literal forms.
+ *
+ * **Each form escapes its own delimiter and only its own** — `design/lang/0013` D1. `\\'` inside a
+ * string and `\\"` inside a character literal are each a second spelling of a character that needs no
+ * escaping there, and admitting them means the two forms have one seven-entry table between them
+ * rather than a six-entry table each.
+ *
+ * That is exactly how the defect arose: `lexString` carried the character form's table, so `"\\'"`
+ * was accepted here and refused by the reference. The decoded value is right either way, so it was a
+ * missing diagnostic and nothing caught it — present since this lexer's first commit, `aedec3b7`.
+ *
+ * **Six places wrote this set down** before it was factored here: the two checks below, the printer's
+ * decoder and `charLitValue` in `print.wac`, and `stringLiteralBytes` and `knownEscapes` in
+ * `emit.wac`. A rule copied six times is a rule that will be changed five times, and
+ * `design/lang/0013` changes it twice more — `\\u{…}` in step 2 and the category rule in step 3.
+ */
+export bool isStringEscape(i32 e) {
+  return e == 'n' || e == 't' || e == 'r' || e == '\\' || e == '"' || e == '0';
+}
+
+/** The same, for a character literal: its own delimiter rather than the string's. */
+export bool isCharEscape(i32 e) {
+  return e == 'n' || e == 't' || e == 'r' || e == '\\' || e == '\'' || e == '0';
+}
+
+/**
+ * The codepoint a `\\u{H…H}` denotes, given the index of its `u`, or -1 when it is not one.
+ *
+ * **One escape that can spell any character** — `design/lang/0013` D2 — and the character escape
+ * rather than a byte escape, so it cannot produce invalid UTF-8. That is the property step 3 leans
+ * on: once every character has a spelling, forbidding the raw ones costs nothing.
+ *
+ * **Its bounds are `string.fromCodepoint`'s**, deliberately: `§wac-str-fromcp-trap-h6qw2np` traps on
+ * a negative value, one above `0x10FFFF`, or a surrogate in `0xD800..0xDFFF`. Making the compile-time
+ * rule the same rule means a literal cannot express what the runtime call would refuse, and there is
+ * one rule to change rather than two that drift apart.
+ *
+ * 1–6 hex digits. Six is what `0x10FFFF` needs; a seventh cannot be in range, so the digit count is
+ * a cheap bound and not merely a style. Answers -1 for every malformed shape — no `{`, no digits, no
+ * closing `}`, out of range, a surrogate — because the caller's response to all of them is the same
+ * diagnostic, and distinguishing them would be a message about *which* way it is wrong when the
+ * reader can see the literal.
+ *
+ * `end` bounds the scan so a literal that runs off the end of the file cannot read past it.
+ */
+export i32 unicodeEscapeValue(u8[] s, i32 at, i32 end) {
+  // `at` is the `u`; the `{` follows it.
+  if (at + 1 >= end || s[at + 1] != '{') { return 0 - 1; }
+  i32 i = at + 2;
+  i32 v = 0;
+  i32 digits = 0;
+  while (i < end && s[i] != '}') {
+    i32 d = hexValue(s[i] as i32);
+    if (d < 0) { return 0 - 1; }
+    v = v * 16 + d;
+    digits = digits + 1;
+    if (digits > 6) { return 0 - 1; }
+    i = i + 1;
+  }
+  if (i >= end || s[i] != '}') { return 0 - 1; }
+  if (digits == 0) { return 0 - 1; }
+  if (v > 1114111) { return 0 - 1; }
+  if (v >= 55296 && v <= 57343) { return 0 - 1; }
+  return v;
+}
+
+/** Just past the `}` of a `\\u{…}` whose `u` is at `at`, or `at + 1` when there is no `}` to find. */
+export i32 unicodeEscapeEnd(u8[] s, i32 at, i32 end) {
+  i32 i = at + 1;
+  while (i < end && s[i] != '}') { i = i + 1; }
+  return i < end ? i + 1 : at + 1;
+}
+
+/**
+ * `cp` as UTF-8 at `out[at]`, answering how many bytes it took.
+ *
+ * The encoder wac's own `string.fromCodepoint` is, written out because a literal is resolved at
+ * compile time and there is no runtime to call. Here rather than beside either caller: the emitter
+ * writes these bytes into a data segment and the printer canonicalises a literal through them, and a
+ * second copy is how the two stop agreeing. Surrogates and values above `0x10FFFF` cannot arrive
+ * — `unicodeEscapeValue` refuses both — so there is no invalid case to encode.
+ */
+export i32 utf8Into(u8[] out, i32 at, i32 cp) {
+  if (cp < 128) { out[at] = cp as@ u8; return 1; }
+  if (cp < 2048) {
+    out[at] = (192 + cp / 64) as@ u8;
+    out[at + 1] = (128 + cp % 64) as@ u8;
+    return 2;
+  }
+  if (cp < 65536) {
+    out[at] = (224 + cp / 4096) as@ u8;
+    out[at + 1] = (128 + (cp / 64) % 64) as@ u8;
+    out[at + 2] = (128 + cp % 64) as@ u8;
+    return 3;
+  }
+  out[at] = (240 + cp / 262144) as@ u8;
+  out[at + 1] = (128 + (cp / 4096) % 64) as@ u8;
+  out[at + 2] = (128 + (cp / 64) % 64) as@ u8;
+  out[at + 3] = (128 + cp % 64) as@ u8;
+  return 4;
+}
+
+/**
+ * The code point encoded at `s[i]`, or -1 when the bytes there are not a well-formed sequence.
+ *
+ * Enough of UTF-8 to ask a question about a character, which is what `design/lang/0013` D3 needs: a
+ * literal's contents are checked by *category*, and a category is a property of a code point rather
+ * than of a byte. Truncation answers -1 rather than guessing, and a caller reads that as "say
+ * nothing" — a malformed sequence in a source file is not this rule's complaint to make.
+ */
+export i32 codepointAt(u8[] s, i32 i) {
+  if (i >= s.len()) { return 0 - 1; }
+  i32 b0 = s[i] as i32;
+  if (b0 < 128) { return b0; }
+  if (b0 < 224 && i + 1 < s.len()) { return ((b0 & 31) * 64) + (s[i + 1] as i32 & 63); }
+  if (b0 < 240 && i + 2 < s.len()) {
+    return ((b0 & 15) * 4096) + ((s[i + 1] as i32 & 63) * 64) + (s[i + 2] as i32 & 63);
+  }
+  if (i + 3 < s.len()) {
+    return ((b0 & 7) * 262144) + ((s[i + 1] as i32 & 63) * 4096) + ((s[i + 2] as i32 & 63) * 64) + (s[i + 3] as i32 & 63);
+  }
+  return 0 - 1;
+}
+
+/** The value of one hex digit, or -1. */
+i32 hexValue(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  return 0 - 1;
+}
+
+/**
+ * Whether the literal at `start` opens with `"""`.
+ *
+ * The token kind is the same for both forms — a block string is a string — so the spelling is what
+ * distinguishes them, and it is read from the span rather than recorded, because the span is what
+ * every other consumer already has.
+ */
+export bool isBlockLiteral(u8[] src, i32 start, i32 len) {
+  return len >= 6 && src[start] == 34 && src[start + 1] == 34 && src[start + 2] == 34;
+}
+
+/**
+ * The least indentation of a block string's **content** lines, in bytes.
+ *
+ * `design/lang/0013` D5: the closing mark's own line does not participate. That is deliberately not
+ * Java, which takes the minimum over the content lines *and* the closing line — so moving the
+ * closing delimiter silently reindents the whole value. Two rules fall out of leaving it out rather
+ * than needing to be stated: a blank line cannot count toward the minimum, and a line indented less
+ * than the margin cannot occur, so there is no clamping rule to get wrong.
+ *
+ * **A tab in the indentation is refused rather than assigned a width**, so no block string can mean
+ * two things to two readers. Answered as -1, which the caller reports.
+ */
+i32 blockMargin(u8[] src, i32 from, i32 to) {
+  i32 margin = 0x7fffffff;
+  i32 i = from;
+  while (i < to) {
+    // One line: [i, eol).
+    i32 eol = i;
+    while (eol < to && src[eol] != 10) { eol = eol + 1; }
+    i32 sp = i;
+    while (sp < eol && src[sp] == 32) { sp = sp + 1; }
+    if (sp < eol && src[sp] == 9) { return 0 - 1; }
+    // A blank line contributes nothing — it has no indentation to speak of, and counting it would
+    // make the margin zero for any value with a paragraph break in it.
+    if (sp < eol && (sp - i) < margin) { margin = sp - i; }
+    i = eol + 1;
+  }
+  return margin == 0x7fffffff ? 0 : margin;
+}
+
+/**
+ * A block string's bytes: the margin removed from each content line, then the escapes resolved.
+ *
+ * The closing mark decides one thing and one thing only — whether the value ends in a newline
+ * (`design/lang/0013` D5). Put the mark on its own line and it does; put it at the end of the last
+ * content line and it does not. Nothing else about the value depends on where it sits.
+ *
+ * Trailing whitespace is kept — D6 — so no `\s`-style escape hatch is needed. The accepted cost is
+ * that an editor which trims on save silently changes a value.
+ */
+export u8[] blockValue(u8[] src, i32 start, i32 len) {
+  // Past the opening `"""` and its unconditional newline; before the closing `"""`.
+  i32 from = start + 3;
+  while (from < start + len && src[from] != 10) { from = from + 1; }
+  from = from + 1;
+  i32 to = start + len - 3;
+  if (to < from) { to = from; }
+
+  // The closing mark's own line is not content and does not set the margin: what sits between the
+  // last newline and the mark, **when that is only spaces**. Anything else is the last content line
+  // with the mark at its end — `  }"""` — and it was dropped whole whenever a line came before it,
+  // so every multi-line value closed that way lost its last line.
+  i32 lastNl = to;
+  while (lastNl > from && src[lastNl - 1] != 10) { lastNl = lastNl - 1; }
+  bool markAlone = true;
+  for (i32 k = lastNl; k < to; k++) { if (src[k] != 32) { markAlone = false; } }
+  i32 contentEnd = markAlone ? lastNl : to;
+
+  i32 margin = blockMargin(src, from, contentEnd);
+  if (margin < 0) { margin = 0; }          // a tab: reported by the caller, decoded as written
+
+  u8[] outBuf = u8[].filled(len, 0);
+  i32 n = 0;
+  i32 i = from;
+  while (i < contentEnd) {
+    // Skip this line's margin, and no more than what is there — a blank line is shorter than it.
+    i32 eol = i;
+    while (eol < contentEnd && src[eol] != 10) { eol = eol + 1; }
+    i32 j = i + margin < eol ? i + margin : eol;
+    while (j < eol) {
+      if (src[j] == 92 && j + 1 < eol) {
+        if (src[j + 1] == 'u') {
+          i32 cp = unicodeEscapeValue(src, j + 1, eol);
+          if (cp >= 0) { n = n + utf8Into(outBuf, n, cp); j = unicodeEscapeEnd(src, j + 1, eol); continue; }
+        }
+        outBuf[n] = escapeValue(src[j + 1] as i32) as@ u8;
+        n = n + 1;
+        j = j + 2;
+        continue;
+      }
+      outBuf[n] = src[j];
+      n = n + 1;
+      j = j + 1;
+    }
+    if (eol < contentEnd) { outBuf[n] = 10; n = n + 1; }
+    i = eol + 1;
+  }
+  // **The trailing newline is already in `contentEnd`**, and adding one here for a closing mark on
+  // its own line put a second one on every such value. `contentEnd` stops just *after* the last
+  // newline when the mark has a line to itself, and at the mark when it does not — so the loop
+  // above has already emitted exactly the right number, and D5's one job is decided by where
+  // `contentEnd` lands rather than by a rule of its own.
+
+  u8[] exact = u8[].filled(n, 0);
+  for (i32 k = 0; k < n; k++) { exact[k] = outBuf[k]; }
+  return exact;
+}
+
+/**
+ * What an escape denotes — a byte in a string, a codepoint in a character literal.
+ *
+ * Total on purpose. A caller reaches this only for an escape one of the predicates above admitted,
+ * and the three that denote themselves (`\\\\`, `\\"`, `\\'`) need no entry; answering the character
+ * for anything else keeps a rejected escape's *value* the same as it was before it was rejected,
+ * which is what a diagnostic wants — the error is about the spelling, not about the byte.
+ */
+export i32 escapeValue(i32 e) {
+  if (e == 'n') { return 10; }
+  if (e == 't') { return 9; }
+  if (e == 'r') { return 13; }
+  if (e == '0') { return 0; }
+  return e;
+}
+
+/**
+ * A string literal. The span kept is the whole literal including both quotes, so
+ * a consumer can re-scan the escapes.
+ */
+void lexString(Lexer lx, Lexed out, Modes md, i32 startLine, i32 startCol) {
+  i32 start = lx.pos;
+  lx.advance();                       // opening quote
+  lexStringBody(lx, out, md, start, startLine, startCol, false);
+}
+
+/**
+ * A literal from `start` to its closing quote, where `start` is not necessarily a quote.
+ *
+ * **The segment of an interpolated literal is the reason this is separate.** `"a\{e}bc"` lexes as
+ * `"a\{` `+` `e` `+` `}bc"` — three tokens whose spans are contiguous runs of the real file, so
+ * every column in every diagnostic is right without synthesising any source. The first opens with a
+ * quote and closes with `\{`; the last opens with `}`; a middle one has neither. What they have in
+ * common is the body, which is this. `design/lang/0013` D7.
+ */
+void lexStringBody(Lexer lx, Lexed out, Modes md, i32 start, i32 startLine, i32 startCol,
+                   bool interpolated) {
+  bool closed = false;
+  while (!lx.atEnd() && !closed) {
+    i32 c = lx.peek(0);
+    if (c == '"') {
+      lx.advance();
+      closed = true;
+    } else if (c == '\\') {
+      lx.advance();
+      if (lx.atEnd()) { break; }
+      i32 escAt = lx.pos;
+      i32 esc = lx.advance();
+      if (esc == 'u') {
+        // The scan is over the whole source, bounded by its length: a `\\u{` with no `}` before the
+        // end of the file is malformed rather than a reason to read past it.
+        if (unicodeEscapeValue(lx.src, escAt, lx.src.len()) < 0) {
+          fail(out, errBadUnicodeEscape(), startLine, startCol);
+        }
+        while (lx.pos < unicodeEscapeEnd(lx.src, escAt, lx.src.len())) { lx.advance(); }
+      } else if (esc == '{') {
+        // **The segment ends here and the expression begins** — D7 says interpolation is *exactly*
+        // sugar for `+`, so what the parser is handed is the token stream of `"a" + e + "bc"` and
+        // nothing downstream of the lexer needs to know. The `+` is spanned over the `\{` that
+        // stands for it, which is the nearest thing in the file to the operator it means.
+        // **The parentheses are not optional.** Without them `"a\{e}b".len()` desugars to
+        // `"a" + e + "b".len()` and the postfix binds to the last segment. Every test that writes
+        // `string s = …;` then `s.len()` passes either way, which is why the spec's own fence is
+        // what caught it. The first `\{` opens the group and the closing quote shuts it, each
+        // spanned over the quote it stands beside.
+        if (!interpolated) { pushToken(out, kLparen(), start, 1, startLine, startCol); }
+        pushToken(out, kString(), start, lx.pos - start, startLine, startCol);
+        pushToken(out, kPlus(), lx.pos - 2, 2, startLine, startCol);
+        // **And the expression is a group of its own**, zero-width: `"\{x is null}"` is
+        // `"" + (x is null) + ""`, where without it `+` binds tighter than `is` and takes `x` away.
+        pushToken(out, kLparen(), lx.pos, 0, startLine, startCol);
+        md.push(cInterp(), md.mode, 0);
+        md.mode = mNormal();
+        return;
+      } else if (!isStringEscape(esc)) {
+        fail(out, errUnknownEscape(), startLine, startCol);
+      }
+    } else if (c == '\n') {
+      // **A newline ends the literal, here, rather than running to the end of the file.**
+      // `design/lang/0013` D3 calls this the everyday payoff of the category rule: a missing
+      // closing quote used to swallow every line after it and then report `unterminated string
+      // literal` at the *opening* quote, so one typo pointed at the wrong place and took the rest
+      // of the file with it. Reported where the line ends, and `closed` so the check below does not
+      // say it a second time — one typo, one diagnostic.
+      fail(out, errUnterminatedString(), lx.line, lx.col);
+      closed = true;
+    } else {
+      // **What may appear raw** — `design/lang/0013` D3. Category C and the two separators are
+      // refused; every one of them is still expressible as `\u{…}`, which is why step 2 came first.
+      // Asked of the code point rather than the byte, since a category is a property of the
+      // character: `codepointAt` decodes, and answers -1 for a truncated sequence, which is not
+      // this rule's complaint.
+      //
+      // **Only where a character starts.** This loop walks bytes, and asking the question at a
+      // *continuation* byte decodes nonsense: `—` is `E2 80 94`, and the `80` on its own reads as a
+      // two-byte lead and answers 20, which is a C0 control — so every em dash in the tree was
+      // refused, `packages/wac/src/wac.wac` first. `advance` already makes this distinction for the
+      // column count; 0x80..0xBF is the continuation range.
+      i32 b = lx.peek(0);
+      if (b < 128 || b >= 192) {
+        i32 cp = codepointAt(lx.src, lx.pos);
+        if (cp >= 0 && !isLiteralChar(cp)) { fail(out, errRawCharacter(), startLine, startCol); }
+      }
+      lx.advance();
+    }
+  }
+  if (!closed) { fail(out, errUnterminatedString(), startLine, startCol); }
+  pushToken(out, kString(), start, lx.pos - start, startLine, startCol);
+  if (interpolated) { pushToken(out, kRparen(), lx.pos - 1, 1, lx.line, lx.col); }
+}
+
+
+/**
+ * Where a literal token's content starts and ends — its span minus its delimiters.
+ *
+ * **Four walks read this and they all have to agree**: `stringLiteralBytes` un-escapes the content,
+ * `knownEscapes` decides whether it can, and both printers re-render it. The arithmetic was written
+ * out at each of them, and interpolation gave a segment a two-byte closing delimiter — so fixing
+ * one turned `"a\{e}bc"` from a lexer error into *a string literal with an escape this slice cannot
+ * read*, and fixing two more left the printers rendering `"a{"`. It is written once here.
+ *
+ * Opening is three bytes for a block literal and one otherwise: a quote, or the `}` that closed an
+ * interpolated expression. Closing is three, or two when the segment runs into a `\{`, or one for
+ * a quote — **or none at all**, which is an unterminated literal the lexer has already reported and
+ * this must not chop a byte off. A whole literal can never end `\{`, since an escaped backslash
+ * before a brace reads as `\\` then `{`. `design/lang/0013` D7.
+ */
+export i32 literalBodyStart(u8[] src, i32 start, i32 len) {
+  return start + (isBlockLiteral(src, start, len) ? 3 : 1);
+}
+
+export i32 literalBodyEnd(u8[] src, i32 start, i32 len) {
+  if (isBlockLiteral(src, start, len)) { return start + len - 3; }
+  if (len >= 2 && src[start + len - 2] == 92 && src[start + len - 1] == '{') {
+    return start + len - 2;
+  }
+  if (len > 1 && src[start + len - 1] == '"') { return start + len - 1; }
+  return start + len;
+}
+
+/**
+ * A block string — `"""`, a newline, the content, then the closing mark.
+ *
+ * `design/lang/0013` D5 and D6. The token is a `kString` like any other and its span is the whole
+ * literal, so everything downstream sees one kind of string; what differs is how the bytes are read
+ * back out, which `blockStringBytes` in `emit.wac` does.
+ *
+ * **The opening newline is unconditional.** `"""x` is an error rather than a literal beginning with
+ * `x`: the margin is computed from the content lines, and a first line that began on the opening
+ * mark's own line would have no indentation to contribute and would silently set the margin to
+ * zero. Requiring the newline removes the case rather than deciding it.
+ *
+ * Escapes are cooked exactly as in `"…"` — D6 — because D3 has just forbidden raw control
+ * characters and every character has to stay expressible. The accepted cost is that a backslash in
+ * the text is a trap: `C:\new\table` is a newline and a tab.
+ */
+void lexBlockString(Lexer lx, Lexed out, i32 startLine, i32 startCol) {
+  i32 start = lx.pos;
+  lx.advance(); lx.advance(); lx.advance();       // the opening `"""`
+
+  // **The newline first, and nothing but space before it.** Anything else is content that would sit
+  // outside the margin rule, so it is refused where it is written rather than mis-indented later.
+  while (!lx.atEnd() && (lx.peek(0) == ' ' || lx.peek(0) == 13)) { lx.advance(); }
+  if (lx.atEnd() || lx.peek(0) != '\n') {
+    fail(out, errBlockStringOpen(), startLine, startCol);
+  } else {
+    lx.advance();
+  }
+
+  bool closed = false;
+  while (!lx.atEnd() && !closed) {
+    if (lx.peek(0) == '"' && lx.peek(1) == '"' && lx.peek(2) == '"') {
+      lx.advance(); lx.advance(); lx.advance();
+      closed = true;
+      continue;
+    }
+    i32 c = lx.peek(0);
+    if (c == '\\') {
+      lx.advance();
+      if (lx.atEnd()) { break; }
+      i32 escAt = lx.pos;
+      i32 esc = lx.advance();
+      if (esc == 'u') {
+        if (unicodeEscapeValue(lx.src, escAt, lx.src.len()) < 0) {
+          fail(out, errBadUnicodeEscape(), startLine, startCol);
+        }
+        while (lx.pos < unicodeEscapeEnd(lx.src, escAt, lx.src.len())) { lx.advance(); }
+      } else if (esc == '{') {
+        // Not interpolation here: `lexBlockString` is a scanner of its own, and D7 says nothing
+        // about block strings. Said by name rather than as an unknown escape, since the reader has
+        // just learned that `"a\{e}b"` works.
+        fail(out, errBlockInterp(), startLine, startCol);
+      } else if (!isStringEscape(esc)) {
+        fail(out, errUnknownEscape(), startLine, startCol);
+      }
+      continue;
+    }
+    // **D6 asks for a tab in the indentation to be refused, and D3 already refuses it.** A tab is
+    // `Cc`, so the rule below — any raw character in category C — catches it wherever it appears,
+    // indentation or content. A separate check gave *two* diagnostics for one tab, which is how it
+    // was found; D6's clause is a consequence of D3 rather than a rule of its own.
+    //
+    // **A newline is content here**, unlike in a `"…"`, which is the whole point of the form. Every
+    // other character answers to D3 exactly as it does in a one-line literal.
+    if (c != '\n') {
+      i32 b = lx.peek(0);
+      if (b < 128 || b >= 192) {
+        i32 cp = codepointAt(lx.src, lx.pos);
+        if (cp >= 0 && !isLiteralChar(cp)) { fail(out, errRawCharacter(), startLine, startCol); }
+      }
+    }
+    lx.advance();
+  }
+  if (!closed) { fail(out, errUnterminatedString(), startLine, startCol); }
+  pushToken(out, kString(), start, lx.pos - start, startLine, startCol);
+}
+
+/**
+ * A character literal, emitted as an `int` whose span is the literal. The
+ * reference emits the decimal codepoint as the token's text; the value is
+ * recovered from the span by `tokenCodepoint`.
+ */
+void lexChar(Lexer lx, Lexed out, i32 startLine, i32 startCol) {
+  i32 start = lx.pos;
+  lx.advance();                       // opening quote
+
+  if (lx.atEnd()) {
+    fail(out, errUnterminatedChar(), startLine, startCol);
+    pushToken(out, kInt(), start, lx.pos - start, startLine, startCol);
+    return;
+  }
+  if (lx.peek(0) == '\'') {
+    lx.advance();
+    fail(out, errEmptyChar(), startLine, startCol);
+    pushToken(out, kInt(), start, lx.pos - start, startLine, startCol);
+    return;
+  }
+
+  if (lx.peek(0) == '\\') {
+    lx.advance();
+    if (lx.atEnd()) {
+      fail(out, errUnterminatedChar(), startLine, startCol);
+      pushToken(out, kInt(), start, lx.pos - start, startLine, startCol);
+      return;
+    }
+    i32 escAt = lx.pos;
+    i32 esc = lx.advance();
+    if (esc == 'u') {
+      if (unicodeEscapeValue(lx.src, escAt, lx.src.len()) < 0) {
+        fail(out, errBadUnicodeEscape(), startLine, startCol);
+      }
+      while (lx.pos < unicodeEscapeEnd(lx.src, escAt, lx.src.len())) { lx.advance(); }
+    } else if (!isCharEscape(esc)) {
+      fail(out, errUnknownEscape(), startLine, startCol);
+    }
+  } else {
+    // The same rule as a string's contents — `design/lang/0013` D3. A character literal is one
+    // character, and "any character except category C" is the same set on both sides of the two
+    // quote marks; a rule that held for `"…"` and not for `'…'` would be two rules.
+    // A character literal's first byte is a character start by construction, so the continuation
+    // guard the string scanner needs is not needed here — the loop below eats the rest.
+    i32 cp = codepointAt(lx.src, lx.pos);
+    if (cp >= 0 && !isLiteralChar(cp)) { fail(out, errRawCharacter(), startLine, startCol); }
+    // One character, however many bytes it takes.
+    lx.advance();
+    while (!lx.atEnd() && lx.peek(0) >= 0x80 && lx.peek(0) < 0xC0) {
+      lx.advance();
+    }
+  }
+
+  if (lx.atEnd()) {
+    fail(out, errUnterminatedChar(), startLine, startCol);
+  } else if (lx.peek(0) == '\'') {
+    lx.advance();
+  } else {
+    // More than one character before the closing quote.
+    while (!lx.atEnd() && lx.peek(0) != '\'' && lx.peek(0) != '\n') { lx.advance(); }
+    if (!lx.atEnd() && lx.peek(0) == '\'') { lx.advance(); }
+    fail(out, errCharTooLong(), startLine, startCol);
+  }
+  pushToken(out, kInt(), start, lx.pos - start, startLine, startCol);
+}
+
+void lexNumber(Lexer lx, Lexed out, i32 startLine, i32 startCol) {
+  i32 start = lx.pos;
+
+  if (lx.peek(0) == '0' && (lx.peek(1) == 'x' || lx.peek(1) == 'X')) {
+    lx.advance();
+    lx.advance();
+    // A digit first: `0x` and `0x_` were read as zero, which no spelling of zero should be.
+    if (lx.atEnd() || !isHexDigit(lx.peek(0))) { fail(out, errHexDigits(), startLine, startCol); }
+    while (!lx.atEnd() && (isHexDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
+    pushToken(out, kInt(), start, lx.pos - start, startLine, startCol);
+    return;
+  }
+
+  while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
+
+  // **After a `.`, digits are a tuple member's position** — `t.0.1` is two selections, not `t.` and
+  // the float `0.1` (spec ch14 `§wac-tuple-members-mef8e82`).
+  i32 before = out.tokenCount > 0 ? out.tokens[(out.tokenCount - 1) * tokenStride()] : -1;
+  if (before == kDot() || before == kQuestionDot()) {
+    pushToken(out, kInt(), start, lx.pos - start, startLine, startCol);
+    return;
+  }
+
+  // A decimal point, an exponent, or both — either marks the literal a float. The reference stopped
+  // requiring the point in wac issue 0018, and the differential test compares token for token, so
+  // this has to move with it.
+  if (lx.peek(0) == '.' && isDigit(lx.peek(1))) {
+    lx.advance();
+    while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
+    takeExponent(lx);
+    pushToken(out, kFloat(), start, lx.pos - start, startLine, startCol);
+  } else if (takeExponent(lx)) {
+    pushToken(out, kFloat(), start, lx.pos - start, startLine, startCol);
+  } else {
+    pushToken(out, kInt(), start, lx.pos - start, startLine, startCol);
+  }
+}
+
+/**
+ * Consume an exponent if one is really there, reporting whether it was.
+ *
+ * `1e` and `1electron` are an integer followed by an identifier, not malformed floats, so the digits
+ * after `e` are what decides — checking for `e` alone would swallow the identifier.
+ */
+bool takeExponent(Lexer lx) {
+  if (lx.peek(0) != 'e' && lx.peek(0) != 'E') { return false; }
+  bool signed = lx.peek(1) == '+' || lx.peek(1) == '-';
+  i32 digitAt = signed ? 2 : 1;
+  if (!isDigit(lx.peek(digitAt))) { return false; }
+  lx.advance();
+  if (signed) { lx.advance(); }
+  while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
+  return true;
+}
+
+/**
+ * `@"…"` — a name written verbatim, spec ch01 `§wac-verbatim-name-jzwznre`.
+ *
+ * **An identifier whose span is the quoted text**, so everything downstream that reads a name by its
+ * span reads the text: `@"n"` and `n` are one binding without anything else knowing verbatim names
+ * exist (`§wac-verbatim-same-name-axnpc5w`), and `@"for"` is a name rather than the keyword because the
+ * kind is decided here and never by the text. It has no escapes and ends at the next `"`, on its line.
+ */
+void lexVerbatimName(Lexer lx, Lexed out, i32 startLine, i32 startCol) {
+  lx.advance();
+  lx.advance();
+  i32 start = lx.pos;
+  while (!lx.atEnd() && lx.peek(0) != '"' && lx.peek(0) != '\n') { lx.advance(); }
+  i32 len = lx.pos - start;
+  if (lx.atEnd() || lx.peek(0) != '"' || len == 0) {
+    fail(out, errVerbatimName(), startLine, startCol);
+    return;
+  }
+  lx.advance();
+  pushToken(out, kIdent(), start, len, startLine, startCol);
+}
+
+/**
+ * `as`, `as!`, `as~` and `as@` — the one place an identifier can grow a suffix, so
+ * it is handled where the identifier is recognised rather than with the operators.
+ */
+i32 identOrKeyword(Lexer lx, i32 start, i32 len) {
+  i32 kind = keywordKind(lx.src, start, len);
+  if (kind != kAs()) { return kind; }
+  i32 c = lx.peek(0);
+  if (c == '!') { lx.advance(); return kAsBang(); }
+  if (c == '~') { lx.advance(); return kAsTilde(); }
+  if (c == '@') { lx.advance(); return kAsAt(); }
+  return kAs();
+}
+
+// ── Operators ─────────────────────────────────────────────────────────────────
+//
+// One function per lead byte, longest match first. Split out from the main loop
+// because wac has no fallthrough and no multi-byte switch, so a single `switch`
+// over the lead byte with nested prefix tests is the shape that stays readable.
+
+/** The kind for an operator starting at the current position, consuming its bytes. */
+i32 lexOperator(Lexer lx) {
+  i32 c = lx.advance();
+
+  if (c == '+') {
+    if (lx.peek(0) == '+') { lx.advance(); return kInc(); }
+    if (lx.peek(0) == '=') { lx.advance(); return kPlusEq(); }
+    return kPlus();
+  }
+  if (c == '-') {
+    if (lx.peek(0) == '-') { lx.advance(); return kDec(); }
+    if (lx.peek(0) == '=') { lx.advance(); return kMinusEq(); }
+    return kMinus();
+  }
+  if (c == '*') {
+    if (lx.peek(0) == '=') { lx.advance(); return kStarEq(); }
+    return kStar();
+  }
+  if (c == '/') {
+    if (lx.peek(0) == '=') { lx.advance(); return kSlashEq(); }
+    return kSlash();
+  }
+  if (c == '%') {
+    if (lx.peek(0) == '=') { lx.advance(); return kPercentEq(); }
+    return kPercent();
+  }
+  if (c == '=') {
+    if (lx.peek(0) == '=') { lx.advance(); return kEq(); }
+    // `=>` before `=`, and after `==`, which is the only ordering that lexes all three: `a == b`
+    // must not become `=` then `>`, and `a >= b` is reached by the `>` branch below rather than here.
+    if (lx.peek(0) == '>') { lx.advance(); return kFatArrow(); }
+    return kAssign();
+  }
+  if (c == '!') {
+    if (lx.peek(0) == '=') { lx.advance(); return kNe(); }
+    return kBang();
+  }
+  if (c == '<') {
+    if (lx.peek(0) == '<') {
+      lx.advance();
+      if (lx.peek(0) == '=') { lx.advance(); return kShlEq(); }
+      return kShl();
+    }
+    if (lx.peek(0) == '=') { lx.advance(); return kLe(); }
+    return kLt();
+  }
+  if (c == '>') {
+    if (lx.peek(0) == '>') {
+      lx.advance();
+      if (lx.peek(0) == '>') {
+        lx.advance();
+        if (lx.peek(0) == '=') { lx.advance(); return kShrUEq(); }
+        return kShrU();
+      }
+      if (lx.peek(0) == '=') { lx.advance(); return kShrEq(); }
+      return kShr();
+    }
+    if (lx.peek(0) == '=') { lx.advance(); return kGe(); }
+    return kGt();
+  }
+  if (c == '&') {
+    if (lx.peek(0) == '&') { lx.advance(); return kAndAnd(); }
+    if (lx.peek(0) == '=') { lx.advance(); return kAndEq(); }
+    return kAnd();
+  }
+  if (c == '|') {
+    if (lx.peek(0) == '|') { lx.advance(); return kOrOr(); }
+    if (lx.peek(0) == '=') { lx.advance(); return kOrEq(); }
+    return kOr();
+  }
+  if (c == '^') {
+    if (lx.peek(0) == '=') { lx.advance(); return kCaretEq(); }
+    return kCaret();
+  }
+  if (c == '~') { return kTilde(); }
+  if (c == '(') { return kLparen(); }
+  if (c == ')') { return kRparen(); }
+  if (c == '{') { return kLbrace(); }
+  if (c == '}') { return kRbrace(); }
+  if (c == '[') { return kLbrack(); }
+  if (c == ']') { return kRbrack(); }
+  if (c == ';') { return kSemi(); }
+  if (c == ':') { return kColon(); }
+  if (c == ',') { return kComma(); }
+  if (c == '.') { return kDot(); }
+  if (c == '?') {
+    // `?.`, spec ch10 — one token, since nothing else puts a `.` straight after a `?`. **`??` is
+    // two `?` tokens**, because `T??` is a type and every lookahead that recognises one counts `?`s;
+    // the expression parser reads two adjacent ones as the operator.
+    if (lx.peek(0) == '.') { lx.advance(); return kQuestionDot(); }
+    return kQuestion();
+  }
+  if (c == '@') { return kAt(); }
+
+  return -1;   // not an operator: the caller reports it
+}
+
+// ── JSX modes ─────────────────────────────────────────────────────────────────
+//
+// Everything above this line reads wac the same way wherever it is in the file.
+// JSX is the exception: `it's here` between two tags is nine characters of text,
+// and the same bytes in wac are a character literal that swallows the closing tag.
+// So the lexer has three modes and a stack to say which one it is in.
+//
+//   normal   wac, as always
+//   tag      inside `<name …`, up to the `>` or `/>` that ends it — still wac,
+//            because an attribute is a name, a string or `{expr}`
+//   text     an element's children: a run of text ends at `{` or at a `<` that
+//            starts a tag, and nothing inside it begins a string, a character
+//            literal or a comment
+//
+// **A `<` in normal mode starts a tag exactly where it could not be the less-than
+// operator** — where the token before it cannot end an expression. `a < b`, `f(x) < 2`
+// and `Vec<i32>` all follow something that can; `return <div/>`, `f(<b/>)` and
+// `x = <p/>` do not. That is why no program without JSX can lex differently than it
+// did: every `<` in one of them follows an expression.
+//
+// The modes nest, so they are a stack rather than a variable: `<div a={f(<b/>)}>`
+// is tag → normal → tag, and each level has to remember what to go back to.
+
+i32 mNormal() { return 0; }
+i32 mTag()    { return 1; }
+i32 mText()   { return 2; }
+
+/** Inside `<name …`. `num` bit 1 means it began `</`, bit 0 that a `/` has been seen. */
+i32 cTag()  { return 0; }
+/** Inside an element's children. */
+i32 cElem() { return 1; }
+/** Inside `{ … }`, with `num` counting the braces still open. */
+i32 cExpr() { return 2; }
+/**
+ * Inside a string literal's `\{ … }`, with `num` counting the braces still open.
+ *
+ * It is on the same stack as the JSX modes because it nests with them the same way and for the same
+ * reason — `"\{ <b>{x}</b> }"` is interpolation → tag → expression — and because the stack's
+ * sizing already covers it: every push consumes a distinct `<`, `{` or `>`, and the `{` of a `\{`
+ * is one. `design/lang/0013` D7.
+ */
+i32 cInterp() { return 3; }
+
+/**
+ * The mode stack: `(kind, ret, num)` per entry, where `ret` is the mode to restore.
+ *
+ * Grown when full, so it cannot overflow.
+ */
+struct Modes {
+  i32[] stk;
+  i32 sp;
+  i32 mode;
+
+  void push(this, i32 kind, i32 ret, i32 num) {
+    i32 at = this.sp * 3;
+    if (at + 3 > this.stk.len()) {
+      i32[] bigger = i32[].filled(this.stk.len() * 2 + 3, 0);
+      bigger.copyFrom(this.stk, 0, 0, this.stk.len());
+      this.stk = bigger;
+    }
+    this.stk[at] = kind;
+    this.stk[at + 1] = ret;
+    this.stk[at + 2] = num;
+    this.sp++;
+  }
+
+  i32 topKind(const this) { return this.sp == 0 ? -1 : this.stk[(this.sp - 1) * 3]; }
+  i32 topRet(const this)  { return this.sp == 0 ? mNormal() : this.stk[(this.sp - 1) * 3 + 1]; }
+  i32 topNum(const this)  { return this.sp == 0 ? 0 : this.stk[(this.sp - 1) * 3 + 2]; }
+  void setTopNum(this, i32 v) { if (this.sp > 0) { this.stk[(this.sp - 1) * 3 + 2] = v; } }
+  void pop(this) { if (this.sp > 0) { this.sp--; } }
+}
+
+/**
+ * Whether a token of this kind can end an expression.
+ *
+ * This is the whole discriminator between `<` the operator and `<` the tag, so it is
+ * written as what it means rather than as a list of the places JSX may appear: the
+ * second would have to be revisited every time the grammar gains a position, and
+ * this does not. `!` is here because wac's unwrap is postfix — `s! < n` compares.
+ */
+bool endsExpression(i32 kind) {
+  return kind == kIdent() || kind == kInt() || kind == kFloat() || kind == kString()
+      || kind == kRparen() || kind == kRbrack() || kind == kRbrace()
+      || kind == kTrue() || kind == kFalse() || kind == kNull() || kind == kThis()
+      || kind == kInc() || kind == kDec() || kind == kBang();
+}
+
+/**
+ * **Which `}` ends an expression.** A `}` closing a struct literal or the arms of a `match` used as a
+ * value ends one — `match (s) { A: 1, B: 2 } < 2` compares — and every other `}` closes a block: an
+ * `if`, a loop, a function's body, a lambda's. After a block a `<` cannot be the operator, so it is a
+ * tag: `if (c) { … } <note l={l}>it's</note>;` read `it's` as a character literal while `endsExpression`
+ * counted every `}` alike.
+ *
+ * Decided at the `{` from what precedes it, which is all a lexer has: a name or a `>` before it is a
+ * struct literal (`P {`, `Box<i32> {`), and a `)` is a `match` subject when the `(` it closes followed
+ * `match` written as a value rather than as a statement. Each `(` remembers what preceded it, and each
+ * `{` what it was, on stacks that grow as they are pushed.
+ */
+struct Nesting {
+  i32[] openers;
+  i32 parens;
+  bool[] exprs;
+  i32 braces;
+  /** What preceded the `(` the last `)` closed — `matchStmt()` for `match` starting a statement. */
+  i32 closedOpener;
+  /** Whether the last `}` ended an expression. */
+  bool rbraceEnds;
+
+  /** The `(` just read, after `prev` — and `before`, the token preceding that one. */
+  void openParen(this, i32 prev, i32 before) {
+    if (this.parens >= this.openers.len()) {
+      i32[] bigger = i32[].filled(this.openers.len() * 2 + 1, 0);
+      bigger.copyFrom(this.openers, 0, 0, this.openers.len());
+      this.openers = bigger;
+    }
+    bool stmt = prev == kMatch() && (before < 0 || before == kSemi() || before == kLbrace() || before == kRbrace());
+    this.openers[this.parens] = stmt ? matchStmt() : prev;
+    this.parens = this.parens + 1;
+  }
+
+  void closeParen(this) {
+    if (this.parens == 0) { this.closedOpener = 0 - 1; return; }
+    this.parens = this.parens - 1;
+    this.closedOpener = this.openers[this.parens];
+  }
+
+  /** The `{` just read, after `prev` — or `{` opening an expression in markup, which is always one. */
+  void openBrace(this, i32 prev, bool always) {
+    if (this.braces >= this.exprs.len()) {
+      bool[] bigger = bool[].filled(this.exprs.len() * 2 + 1, false);
+      for (i32 i = 0; i < this.exprs.len(); i++) { bigger[i] = this.exprs[i]; }
+      this.exprs = bigger;
+    }
+    this.exprs[this.braces] = always || prev == kIdent() || prev == kGt()
+                           || (prev == kRparen() && this.closedOpener == kMatch());
+    this.braces = this.braces + 1;
+  }
+
+  void closeBrace(this) {
+    if (this.braces == 0) { this.rbraceEnds = true; return; }
+    this.braces = this.braces - 1;
+    this.rbraceEnds = this.exprs[this.braces];
+  }
+
+  /** Whether a token of kind `prev`, just read, ends an expression. */
+  bool ends(const this, i32 prev) {
+    if (prev == kRbrace()) { return this.rbraceEnds; }
+    return endsExpression(prev);
+  }
+}
+
+/** An opener mark no token kind uses: `match` at the start of a statement, whose braces are a block. */
+i32 matchStmt() { return 0 - 2; }
+
+/**
+ * Whether `<` at the current position opens or closes a tag rather than being text.
+ *
+ * `>` is here for the fragment `<>…</>`, which is a tag with no name — and it is why `<p>1 < 2</p>`
+ * still works while `<p>a <> b</p>` does not: what follows the `<` is the whole of the question.
+ */
+bool startsTag(Lexer lx, i32 offset) {
+  i32 c = lx.peek(offset);
+  // `<@"caption">` — a tag name written verbatim is a name like any other — and `<"my-widget">`, an
+  // element by name (spec ch23 `§wac-markup-quoted-tag-builds-vn2k8xr`).
+  return c == '/' || c == '>' || c == '"' || isIdentStart(c) || (c == '@' && lx.peek(offset + 1) == '"');
+}
+
+/**
+ * Move the mode machine, given the operator just emitted.
+ *
+ * Only operators move it — a string, a number or an identifier never changes which
+ * language is being read — so this is called from one place.
+ */
+void jsxAfterOperator(Modes md, Lexer lx, i32 kind, i32 prevKind, bool prevEnds) {
+  if (md.mode == mNormal()) {
+    // **`fn<` is a function type, never a tag.** `fn` cannot end an expression, so without this the
+    // `<` after it read as markup opening — `fn<i32(i32)> g` lexed `i32(i32)` as a tag and everything
+    // after the `>` as text.
+    if (kind == kLt() && !prevEnds && prevKind != kFn() && startsTag(lx, 0)) {
+      md.push(cTag(), mNormal(), 0);
+      md.mode = mTag();
+      return;
+    }
+    // The braces of a spliced expression, counted so the *matching* one leaves it.
+    if (md.topKind() == cExpr()) {
+      if (kind == kLbrace()) { md.setTopNum(md.topNum() + 1); return; }
+      if (kind == kRbrace()) {
+        md.setTopNum(md.topNum() - 1);
+        if (md.topNum() <= 0) {
+          i32 ret = md.topRet();
+          md.pop();
+          md.mode = ret;
+        }
+      }
+    }
+    return;
+  }
+  if (md.mode == mTag()) {
+    if (kind == kLbrace()) { md.push(cExpr(), mTag(), 1); md.mode = mNormal(); return; }
+    if (kind == kSlash()) { md.setTopNum(md.topNum() | 1); return; }
+    if (kind == kGt()) {
+      i32 num = md.topNum();
+      i32 ret = md.topRet();
+      md.pop();
+      if ((num & 2) != 0) {
+        // `</name>`: this element's children end, and the mode is whatever enclosed it.
+        if (md.topKind() == cElem()) {
+          i32 outer = md.topRet();
+          md.pop();
+          md.mode = outer;
+        } else {
+          md.mode = ret;   // a closing tag with nothing open: the parser reports it
+        }
+      } else if ((num & 1) != 0) {
+        md.mode = ret;     // `<name/>`
+      } else {
+        md.push(cElem(), ret, 0);
+        md.mode = mText();
+      }
+    }
+  }
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+/**
+ * Tokenize `src`.
+ *
+ * Output arrays are sized from the input: at most one token per byte, and errors
+ * capped at a fraction of that since a pathological input would otherwise allocate
+ * a triple per byte.
+ */
+export Lexed lex(u8[] src) {
+  i32 n = src.len();
+  // **A constant, not a fraction of the input** — `issues/system/0239c`. Sizing this from `n` means a
+  // file of dense garbage reports a diagnostic per few bytes, and each one is rendered with its source
+  // line under it. On input with no newlines that line is the whole file, so the output is quadratic in
+  // the file's size before anything is printed: a 75 KB wasm module handed to the compiler as source
+  // produced 3,894 lexer errors and burned ninety seconds without writing a byte. Measured on prefixes
+  // of it, 2 KB of input made 1.5 MB of diagnostics and 16 KB made 18.6 MB.
+  //
+  // 64 is the number the *parser* already caps itself at, one `i32[192]` next door, and the argument is
+  // the same: nobody reads the four thousandth message, and the first sixty-four say the same thing
+  // about the same file. A real source file does not come near it — the worst in this repository is a
+  // 36 KB HTML document at about 130 diagnostics *in total*, of which few are the lexer's.
+  i32 maxErrors = 64;
+  // **Sized for a token per eight bytes and grown by `pushToken`**, not one per byte: `std` is 173 KB
+  // and 13,000 tokens, so one per byte zeroed 3.5 MB to use a fourteenth of it, once per pass that
+  // lexed it (`issues/lang/0398b`).
+  Lexed out = Lexed(
+    i32[].filled((n / 8 + 16) * tokenStride(), 0), 0,
+    i32[].filled(maxErrors * errorStride(), 0), 0,
+    0, false
+  );
+  Lexer lx = Lexer(src, 0, 1, 1);
+  // The stacks grow as they are pushed. They were sized by two passes over the input first, which was
+  // a third of what lexing cost.
+  Modes md = Modes(i32[].filled(16 * 3, 0), 0, mNormal());
+  Nesting nest = Nesting(i32[].filled(16, 0), 0, bool[].filled(16, false), 0, 0 - 1, false);
+
+  while (true) {
+    // **Text first, and no whitespace skipping**: in an element's children a space is
+    // content, and `//` is two characters of a URL rather than a comment.
+    if (md.mode == mText()) {
+      if (lx.atEnd()) { break; }
+      i32 textLine = lx.line;
+      i32 textCol = lx.col;
+      i32 textStart = lx.pos;
+      i32 c0 = lx.peek(0);
+      if (c0 == '{') {
+        lx.advance();
+        pushToken(out, kLbrace(), textStart, 1, textLine, textCol);
+        nest.openBrace(kLbrace(), true);
+        md.push(cExpr(), mText(), 1);
+        md.mode = mNormal();
+        continue;
+      }
+      if (c0 == '<' && startsTag(lx, 1)) {
+        bool closing = lx.peek(1) == '/';
+        lx.advance();
+        pushToken(out, kLt(), textStart, 1, textLine, textCol);
+        md.push(cTag(), mText(), closing ? 2 : 0);
+        md.mode = mTag();
+        continue;
+      }
+      // A run. It ends at `{` or at a `<` that starts a tag — so `1 < 2` between tags
+      // is text, which is the one place this is kinder than the JSX it copies.
+      while (!lx.atEnd()) {
+        i32 c = lx.peek(0);
+        if (c == '{') { break; }
+        if (c == '<' && startsTag(lx, 1)) { break; }
+        lx.advance();
+      }
+      pushToken(out, kJsxText(), textStart, lx.pos - textStart, textLine, textCol);
+      continue;
+    }
+
+    skipSpaceAndComments(lx, out);
+    if (lx.atEnd()) { break; }
+
+    i32 startLine = lx.line;
+    i32 startCol = lx.col;
+    i32 c = lx.peek(0);
+
+    if (c == '"' && lx.peek(1) == '"' && lx.peek(2) == '"') {
+      lexBlockString(lx, out, startLine, startCol);
+    } else if (c == '"') {
+      lexString(lx, out, md, startLine, startCol);
+    } else if (c == '\'') {
+      lexChar(lx, out, startLine, startCol);
+    } else if (isDigit(c)) {
+      lexNumber(lx, out, startLine, startCol);
+    } else if (c == '@' && lx.peek(1) == '"') {
+      lexVerbatimName(lx, out, startLine, startCol);
+    } else if (isIdentStart(c) && md.mode == mTag()) {
+      // **Inside a tag a name is written as in HTML**: it runs through hyphens, and no word is a
+      // keyword — `data-size=` and `for=` are attribute names (spec ch23
+      // `§wac-markup-attr-verbatim-param-yd3farv`).
+      i32 start = lx.pos;
+      while (!lx.atEnd() && (isIdentPart(lx.peek(0)) || (lx.peek(0) == '-' && isIdentPart(lx.peek(1))))) {
+        lx.advance();
+      }
+      pushToken(out, kIdent(), start, lx.pos - start, startLine, startCol);
+    } else if (isIdentStart(c)) {
+      i32 start = lx.pos;
+      while (!lx.atEnd() && isIdentPart(lx.peek(0))) { lx.advance(); }
+      i32 len = lx.pos - start;
+      i32 kind = identOrKeyword(lx, start, len);
+      // The cast suffixes lengthen the span, so it is measured after.
+      pushToken(out, kind, start, lx.pos - start, startLine, startCol);
+    } else {
+      i32 start = lx.pos;
+      // Read before emitting: what the token *before* this one was is what says whether
+      // a `<` is an operator.
+      i32 prevKind = out.tokenCount == 0
+        ? -1
+        : out.tokens[(out.tokenCount - 1) * tokenStride()];
+      // **Inside a tag a `>` only ends it**, so it is one byte: `<m>==</m>` is a tag and the text `==`,
+      // where the operator reader would take `>=` and leave the tag open.
+      i32 kind = -1;
+      if (md.mode == mTag() && c == '>') {
+        lx.advance();
+        kind = kGt();
+      } else {
+        kind = lexOperator(lx);
+      }
+      if (kind < 0) {
+        fail(out, errUnexpectedChar(), startLine, startCol);
+      } else if (kind == kRbrace() && md.topKind() == cInterp() && md.topNum() == 0) {
+        // **The `}` is the other `+`**, and the literal resumes at it: the next segment's span
+        // starts on this byte, so `}bc"` is one contiguous run of the file. The expression's group
+        // closes first, zero-width.
+        // **An empty one is the reader's mistake, and is said as one**: the group the lexer opened
+        // would otherwise reach the checker as a `()` the reader never wrote.
+        if (out.tokenCount > 0 && out.tokens[(out.tokenCount - 1) * tokenStride()] == kLparen()
+            && out.tokens[(out.tokenCount - 1) * tokenStride() + 2] == 0) {
+          fail(out, errEmptyInterp(), startLine, startCol);
+        }
+        pushToken(out, kRparen(), start, 0, startLine, startCol);
+        pushToken(out, kPlus(), start, 1, startLine, startCol);
+        md.mode = md.topRet();
+        md.pop();
+        lexStringBody(lx, out, md, start, startLine, startCol, true);
+      } else {
+        // Whether the token before ended an expression, asked before this one moves the stacks.
+        bool prevEnds = nest.ends(prevKind);
+        i32 before = out.tokenCount < 2 ? 0 - 1 : out.tokens[(out.tokenCount - 2) * tokenStride()];
+        pushToken(out, kind, start, lx.pos - start, startLine, startCol);
+        if (kind == kLparen()) { nest.openParen(prevKind, before); }
+        if (kind == kRparen()) { nest.closeParen(); }
+        if (kind == kLbrace()) { nest.openBrace(prevKind, md.mode == mTag()); }
+        if (kind == kRbrace()) { nest.closeBrace(); }
+        // Braces the interpolation is not ended by — a lambda body, a struct literal. Only counted
+        // while this frame is the interpolation's; JSX pushes its own and counts its own.
+        if (md.topKind() == cInterp()) {
+          if (kind == kLbrace()) { md.setTopNum(md.topNum() + 1); }
+          if (kind == kRbrace()) { md.setTopNum(md.topNum() - 1); }
+        }
+        jsxAfterOperator(md, lx, kind, prevKind, prevEnds);
+      }
+    }
+  }
+
+  pushToken(out, kEof(), n, 0, lx.line, lx.col);
+  return out;
+}
+
+// ── Flat accessors for the host ───────────────────────────────────────────────
+//
+// bindgen cannot marshal a struct, so the host gets the arrays directly. Trimmed to
+// the used length, since `lex` over-allocates from the source size.
+
+export i32[] lexTokens(u8[] src) {
+  Lexed r = lex(src);
+  i32 n = r.tokenCount * tokenStride();
+  i32[] out = i32[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) {
+    out[i] = r.tokens[i];
+  }
+  return out;
+}
+
+export i32[] lexErrors(u8[] src) {
+  Lexed r = lex(src);
+  i32 n = r.errorCount * errorStride();
+  i32[] out = i32[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) {
+    out[i] = r.errors[i];
+  }
+  return out;
+}

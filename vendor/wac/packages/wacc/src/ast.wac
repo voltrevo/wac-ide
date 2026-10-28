@@ -1,0 +1,670 @@
+// The wac AST, as sum types.
+//
+// This file replaces a flat integer node pool. That pool was not a bad design —
+// real compilers use one deliberately, and it removed an allocation per node — but
+// it was chosen here because wac had no sum types, and the cost landed on every
+// line that touched a node rather than once at the definition:
+//
+//   * `a`, `b`, `c` meant something different per tag, and nothing checked it. The
+//     comments were the only schema.
+//   * Three fields was the hard limit, so `sFor` and `dFunc` packed two node indices
+//     into one i32 (`pack2`/`unpackLo`/`unpackHi`, with `none()` standing in for -1
+//     because -1 does not survive packing). Four references needed a bit-layout
+//     convention.
+//   * Everything shared one tag space, so `sCase` had to be a statement and `dParam`
+//     a declaration, though neither is one.
+//   * A missing case in a walk was silent.
+//
+// All four are gone. `pack2`, `unpackLo`, `unpackHi` and `none` are deleted rather
+// than ported — the three-field limit was their only reason to exist. Case clauses,
+// parameters, fields and import items are now their own types instead of squatting
+// in a tag range. And `match` is exhaustive, so a walk that misses a variant does not
+// compile.
+//
+// Positions live on the wrapper structs rather than being repeated in every variant:
+// `Expr` carries line and col, `Expr.kind` says what it is. That keeps 2 fields in
+// one place instead of 98 across 49 variants, and matches how the reference nests
+// its discriminant inside an object that always has a position.
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export struct Ty {
+  TyKind kind;
+  i32 line;
+  i32 col;
+}
+
+export enum TyKind {
+  /** `i32`, `bool`, `string`, … — `tok` is the name token. */
+  Prim(i32 tok),
+  /**
+   * A named struct, enum or variant, with its type arguments.
+   *
+   * `Vec<i32>` is one of these with one argument, `Map<string, Vec<i32>>` with two. Empty for a plain
+   * name, which is what every non-generic reference is. The resolver substitutes them and nothing after
+   * it sees a non-empty list — but a *parser* has to record them, which is the whole of wac-mono 0003.
+   */
+  Named(i32 tok, Ty[] typeArgs),
+  Arr(Ty elem),
+  Nullable(Ty inner),
+  Funcref(Ty ret, Ty[] params),
+  /** `(A, B)`, `(A,)` and `()` — spec ch14. Identity is the member list. */
+  TupleOf(Ty[] members),
+  /** `type(e)` — the type a `typeref` value stands for, `e` evaluated statically (spec ch30). */
+  TypeOf(Expr e),
+  /** `typeof(e)` — the static type of the expression `e`, which is checked and never evaluated (spec ch30). */
+  TypeofExpr(Expr e),
+}
+
+export Ty tyPrim(i32 tok, i32 line, i32 col) {
+  return Ty(TyKind.Prim(tok), line, col);
+}
+export Ty tyNamed(i32 tok, Ty[] typeArgs, i32 line, i32 col) {
+  return Ty(TyKind.Named(tok, typeArgs), line, col);
+}
+export Ty tyArr(Ty elem, i32 line, i32 col) {
+  return Ty(TyKind.Arr(elem), line, col);
+}
+export Ty tyNullable(Ty inner, i32 line, i32 col) {
+  return Ty(TyKind.Nullable(inner), line, col);
+}
+export Ty tyTuple(Ty[] members, i32 line, i32 col) {
+  return Ty(TyKind.TupleOf(members), line, col);
+}
+export Ty tyFuncref(Ty ret, Ty[] params, i32 line, i32 col) {
+  return Ty(TyKind.Funcref(ret, params), line, col);
+}
+
+// ── Expressions ───────────────────────────────────────────────────────────────
+
+export struct Expr {
+  ExprKind kind;
+  i32 line;
+  i32 col;
+}
+
+/** A named argument in a struct literal: `Point(x: 1, y: 2)`. */
+export struct NamedArg {
+  i32 nameTok;
+  Expr value;
+}
+
+export enum ExprKind {
+  /**
+   * `match (x) { A: 1, default: 2 }` in expression position.
+   *
+   * The statement form is `StmtKind.Match`; this one has a value per arm rather than a body, which is
+   * what `Arm.value` is for. `packages/std`'s `Option<T>` is written with it, and nothing here could
+   * read that file — the parser had the statement and not the expression.
+   */
+  MatchExpr(Expr subject, Arm[] arms),
+  /** `tok` is the literal token; the value is read from the source span. */
+  IntLit(i32 tok),
+  FloatLit(i32 tok),
+  StrLit(i32 tok),
+  /**
+   * `<div class="a">{kid}</div>` — one element, its attributes and its children.
+   *
+   * **Lowered by the emitter, not by the parser.** `design/lang/0004` writes the meaning as wac
+   * source — `Node.Element("div", […], […])` — and that is what it *means*, but it
+   * cannot be what the parser builds: every name in this tree is a token, and the desugaring needs
+   * `Node`, `Attr` and the string `"div"`, none of which the source wrote. Synthesising tokens moves
+   * every line and column in every diagnostic, because they are measured against the lexer's array.
+   * The emitter names types by *string*, so it can write the tree with no token at all.
+   */
+  Jsx(i32 tagTok, i32 closeTok, JsxAttr[] attrs, Expr[] kids),
+  /**
+   * Text between a JSX element's tags — `hello` in `<p>hello {name}</p>`.
+   *
+   * **A span of the source, not tokens.** The text `hello world` is two identifier tokens with a
+   * space between them that no token holds, so the run is recorded as byte offsets and read back
+   * whole. It is an `Expr` because it stands where a child stands, and the emitter turns it into
+   * `Node.Text`. `design/lang/0004`.
+   */
+  JsxText(i32 startOff, i32 endOff),
+  BoolLit(bool value),
+  NullLit,
+  Ident(i32 tok),
+  /** `op` is the operator token. */
+  Unary(i32 op, Expr operand),
+  /**
+   * `await e` — `design/lang/0014`.
+   *
+   * **Its own variant rather than a `Unary` with `op == kAwait()`**, and the reason is which way
+   * the mistake falls. There are 23 `Unary(` arms; a new operator flowing through them would
+   * be handled by whatever each already does with an operator it does not know, silently. A
+   * variant makes every match that must care say so, and the ones that genuinely do not keep
+   * their `else`.
+   */
+  /** `operand` is null for a bare `await;` — one step boundary (spec ch35). */
+  Await(Expr? operand),
+  /** `try e` — `e`'s `Ok` value, or its `Err` returned from the enclosing function (spec ch26). */
+  Try(Expr operand),
+  /** `coroutine f(…)` — the call's machine, with nothing of it run (spec ch36). */
+  CoroutineOf(Expr call),
+  Binary(i32 op, Expr left, Expr right),
+  /** One of `as`, `as!`, `as~`, `as@` — which is in `op`. */
+  Cast(i32 op, Expr operand, Ty target),
+  /**
+   * `x is T`, `x is null`, or `x is y` — reference identity against a value.
+   *
+   * Which of the three is encoded by what is present: `target` for a type test,
+   * `other` for an identity test, neither for a null test. The reference stores the
+   * right side in one field of a union type; there is no union of a type and an
+   * expression here, so they are separate optional fields and at most one is set.
+   */
+  Is(Expr left, Ty? target, Expr? other, bool negated),
+  /** `p matches e` — a pattern tested against a value, binding the pattern's names. spec ch25. */
+  Matches(Pattern pattern, Expr subject),
+  Ternary(Expr cond, Expr then, Expr els),
+  /**
+   * A call, with the type arguments **written at the call** if any were.
+   *
+   * `typeArgs` is empty for every call that does not write them, which is all of them outside a
+   * postfix method call — a free function's are carried by `Construct`'s `Ty` instead, because
+   * `zero<i32>()` and `Vec<i32>(…)` are the same syntax and the parser cannot tell them apart.
+   * So this field exists for `recv.m<U>(x)`, where the letters belong to the *method* rather than
+   * to its owner and there is nowhere else to put them.
+   *
+   * Widening `Call` rather than adding a variant: type arguments belong to a call, and an empty
+   * list is exactly what every existing site means. A new variant would have wanted "not valid
+   * here" in about fifty arms of the exhaustive matches to say the same nothing.
+   *
+   * `design/lang/0011` step 3, which is what makes
+   * [0010](../../../design/lang/0010-a-method-type-parameter-has-to-come-from-the-slot.md) option C
+   * writable.
+   */
+  Call(Expr callee, Expr[] args, Ty[] typeArgs),
+  Index(Expr arr, Expr index),
+  Member(Expr obj, i32 nameTok),
+  /** `p?.m` — `null` when `p` is absent, `p!.m` otherwise. spec ch10. */
+  SafeMember(Expr obj, i32 nameTok),
+  /**
+   * `p?.m(a)` — `null` when `p` is absent, without evaluating `a`, and `p!.m(a)` otherwise. spec ch10.
+   *
+   * **It carries the ordinary call it makes**, `Call(Member(Unwrap(p), m), a, targs)`, so the checker
+   * and every emitter walk judge that call exactly as they judge one written with `!`; a walk recurses
+   * into `call` and nothing else, since `p` is inside it. Only the emitter's value arm differs: it
+   * evaluates `p` once into a local and has the `Unwrap` read that local.
+   */
+  SafeCall(Expr call),
+  /** `x!` — the non-null assertion. */
+  Unwrap(Expr operand),
+  /** `Point(1, 2)` or `Point(x: 1, y: 2)`; one of the two lists is empty. */
+  Construct(Ty ctype, Expr[] args, NamedArg[] named),
+  /**
+   * A written type standing where an expression is parsed, and **only** as the object of a
+   * `Member`: `Maybe<i32>.Just(4)`, `Result<i32, string>.Err(e)`.
+   *
+   * It exists because `Ident(tok)` has nowhere to put type arguments, so the `.` branch of
+   * `parseConstructionOrCall` used to drop them — which is why `Cell<i32>.of(3)` was refused rather
+   * than parsed, and why accepting it without this would have meant `Cell.of(3)`, a spelling whose
+   * meaning is "ignore what you wrote". `issues/lang/0088`, `design/lang/0011`.
+   *
+   * Anywhere other than a `Member`'s object this is an error: a type is not a value.
+   */
+  TypeName(Ty qualifier),
+  /** `typeref(T)` — a value of type `typeref` standing for the type `T` (spec ch30). */
+  TypeRefOf(Ty t),
+  /**
+   * `static_match (T) { u32: 4, default: … }` — spec ch31. The arm whose type is `T` is chosen at
+   * compile time; `default` is at `defaultAt` (-1 when there is none), its entry in `types` unused.
+   */
+  StaticMatch(Ty subject, Ty[] types, Expr[] values, i32 defaultAt),
+  /** `static_trap "…"` where a value is expected — `never`, an error wherever it is compiled. */
+  StaticTrapE(Expr message),
+  /** `++`/`--`; `prefix` distinguishes `++i` from `i++`. */
+  Incr(Lvalue target, i32 op, bool prefix),
+  /**
+   * `i32[].filled(n, 0)`, `i32[].filled(n, v)`, or `[1, 2, 3] as i32[]`.
+   *
+   * `size` and `elements` are exclusive. `fill` accompanies `size` and gives every
+   * element that value, which is the only way to size an array dynamically when the
+   * element type has no default — as anything reachable from an enum does not.
+   */
+  ArrNew(Ty elem, Expr? size, Expr? fill, Expr[] elements),
+  /**
+   * `[a, b, c]` — an array literal. Its element type is not written: it comes from where the array is
+   * going, or from its elements (`spec/2-types/15-arrays.md`), which is why this is not an
+   * `ArrNew` — that one carries a written `Ty` and this has none to carry.
+   */
+  ArrLit(Expr[] elements),
+  /**
+   * `(a, b)`, `(a,)` and `()` — a tuple, spec ch14. `(a)` is grouping and never arrives here.
+   * A member is read as `Member(t, tok)` where `tok` is an integer token: `t.0`.
+   */
+  TupleLit(Expr[] elements),
+  /**
+   * `(i32 a) => a + 1` and `() => { … }` — `design/lang/0002` tier two.
+   *
+   * **One form, because the parser desugars the other.** The note defines `() => e` as
+   * `() => { return e; }`, so an expression body arrives here as a single `Return` statement built
+   * on the arrow's own line and column. Everything downstream — the capture walk, the checker, the
+   * emitter — then has a body that is a statement list, exactly as a function does, rather than two
+   * shapes each of which could be forgotten in a different pass.
+   *
+   * There is no return type and no name. The return type comes from the `fn<…>` this is checked
+   * against, which the language always supplies: wac has no `var`, so a lambda is written into an
+   * assignment, an argument or a `return`, and never floats.
+   *
+   * `isAsync` is `async (T x) => { … }`, and it means here what it means on a function: the body may
+   * `await`, and the value handed to the slot is a `Pending<R>` rather than an `R`. The slot is what
+   * says whether that is allowed — a lambda's return type is never written, so `fn<Pending<R>(…)>` is
+   * both the permission and the type. `issues/lang/0294c`.
+   */
+  Lambda(Param[] params, Stmt[] body, bool isAsync),
+}
+
+// ── Lvalues ───────────────────────────────────────────────────────────────────
+//
+// Kept a separate type from `Expr`, as in the reference: an assignment target is a
+// narrower grammar than an expression, and making that a type rather than a
+// validation pass means an unassignable target cannot be constructed.
+
+export struct Lvalue {
+  LvalueKind kind;
+  i32 line;
+  i32 col;
+}
+
+export enum LvalueKind {
+  LIdent(i32 tok),
+  LField(Lvalue base, i32 nameTok),
+  LIndex(Lvalue base, Expr index),
+  LUnwrap(Lvalue base),
+}
+
+/**
+ * An assignment target read as the expression that names the same place — the receiver an operator
+ * method on a struct is called on, which `a += b` evaluates once and never rebinds (spec ch22
+ * `§wac-operator-compound-own-u7m6y7c`).
+ */
+export Expr lvalueExpr(Lvalue lv) {
+  match (lv.kind) {
+    LIdent(tok): { return Expr(ExprKind.Ident(tok), lv.line, lv.col); }
+    LField(base, nameTok): { return Expr(ExprKind.Member(lvalueExpr(base), nameTok), lv.line, lv.col); }
+    LIndex(base, index): { return Expr(ExprKind.Index(lvalueExpr(base), index), lv.line, lv.col); }
+    LUnwrap(base): { return Expr(ExprKind.Unwrap(lvalueExpr(base)), lv.line, lv.col); }
+  }
+}
+
+/**
+ * The `p` of a `SafeCall`'s `p?.m(a)` — the operand of the `Unwrap` the parser built its receiver as.
+ * The call itself for anything else, which no parser output is.
+ */
+export Expr safeCallReceiver(Expr call) {
+  match (call.kind) {
+    Call(callee, args, typeArgs): {
+      match (callee.kind) {
+        Member(held, nameTok): {
+          match (held.kind) {
+            Unwrap(obj): { return obj; }
+            default: { return call; }
+          }
+        }
+        default: { return call; }
+      }
+    }
+    default: { return call; }
+  }
+}
+
+/** The `m` of a `SafeCall`'s `p?.m(a)`, as a token; -1 for anything else, which no parser output is. */
+export i32 safeCallName(Expr call) {
+  match (call.kind) {
+    Call(callee, args, typeArgs): {
+      match (callee.kind) {
+        Member(held, nameTok): { return nameTok; }
+        default: { return -1; }
+      }
+    }
+    default: { return -1; }
+  }
+}
+
+// ── Statements ────────────────────────────────────────────────────────────────
+
+export struct Stmt {
+  StmtKind kind;
+  i32 line;
+  i32 col;
+}
+
+/**
+ * One `case` or `default` clause.
+ *
+ * Its own type now. In the pool it had to be tag `sCase` in the statement range,
+ * which meant every statement walk saw a node that is not a statement.
+ */
+export struct Case {
+  /** null for `default`. */
+  Expr? value;
+  Stmt[] body;
+  /**
+   * The `case` or `default` keyword's own position.
+   *
+   * A `Case` is not a `Stmt` and has no position otherwise, and *"case value must be i32"* names the
+   * keyword rather than the value — the same exception `override` is, and for the same reason: the
+   * complaint is about the arm rather than about the expression in it.
+   */
+  i32 line;
+  i32 col;
+}
+
+/**
+ * One `Pattern:` or `default:` arm of a `match`.
+ *
+ * `variantTok` is -1 for the `else` arm. A binding of `_` is a discard and is kept as
+ * the token so the printer can reproduce it.
+ */
+/** One JSX attribute: `class="a"` or `id={x}`. The value is always an expression. */
+export struct JsxAttr {
+  i32 nameTok;
+  Expr value;
+}
+
+export struct Arm {
+  i32 variantTok;
+  /**
+   * The `else` keyword's token for an else arm, and -1 for a `case` arm.
+   *
+   * **Because -1 is a position and 1:1 is a lie.** `variantTok` is the sentinel that says "this is the
+   * else arm", and the emitter asked it for a line: `tokenLine`/`tokenCol` floor a negative index to
+   * 1, and a coverage point's file comes from its line in the linked blob, so every else arm in a
+   * program became one point at the entry's 1:1 and covering any of them covered all. The `else`
+   * keyword has a token; the arm simply did not keep it. `issues/lang/0148`.
+   */
+  i32 elseTok;
+  i32[] bindingToks;
+  Stmt[] body;
+  /**
+   * The arm's value, for a `match` used as an *expression* — null for the statement form.
+   *
+   * One arm type for both, as the reference has it: an expression arm has a value and no body, a
+   * statement arm a body and no value. Two types would mean two of everything that walks them.
+   */
+  Expr? value;
+}
+
+/**
+ * One position of a destructuring pattern: a name with its type (null for `auto` or none written), or
+ * a nested group, which has `nameTok` -1 and its positions in `kids`.
+ */
+export struct TupleBinding {
+  Ty? type;
+  i32 nameTok;
+  TupleBinding[] kids;
+  i32 line;
+  i32 col;
+}
+
+export enum StmtKind {
+  /**
+   * `isConst` folds what the pool needed two tags for. `init` is null for `T x;`, which is unassigned
+   * until written, or holds its type's default — spec ch08.
+   */
+  Var(Ty type, i32 nameTok, Expr? init, bool isConst),
+  Assign(Lvalue target, i32 op, Expr rhs),
+  IncrStmt(Lvalue target, i32 op),
+  /** `els` is empty for no else; an `else if` is a single-statement block. */
+  If(Expr cond, Stmt[] then, Stmt[] els),
+  While(Expr cond, Stmt[] body),
+  /** Four references, which the pool could not hold without bit-packing. */
+  For(Stmt? init, Expr? cond, Stmt? update, Stmt[] body),
+  /**
+   * `for (T x in e) { … }` — spec ch25. `type` is null for `auto`, which takes the element type;
+   * `e` is an array or a `Vec` (a generator, when there are generators).
+   */
+  ForIn(Ty? type, i32 nameTok, Expr iterable, Stmt[] body),
+  /**
+   * `(T a, U b) = e;` and its spellings — one local per member of the tuple `e`, nesting allowed
+   * (spec ch14 `§wac-tuple-destructure-gn8i48y`). `type` is the whole tuple's, written before the
+   * names (`(u32, u32) (q, r) = e`), null when each name carries its own or `auto` does.
+   */
+  Destructure(Ty? type, TupleBinding pattern, Expr init),
+  /** `(a, b) = e;` — the members of `e` assigned to existing locals, in order (`§wac-tuple-assign-vmhww2b`). */
+  TupleAssign(Lvalue[] targets, Expr rhs),
+  DoWhile(Stmt[] body, Expr cond),
+  Switch(Expr subject, Case[] cases),
+  Return(Expr? value),
+  Break,
+  Continue,
+  /** `trap;` or `trap <expr>;` — the message the host is told, in place of a bare unreachable. */
+  Trap(Expr? value),
+  Match(Expr subject, Arm[] arms),
+  Block(Stmt[] body),
+  ExprStmt(Expr expr),
+  /** `defer s;` — `s` runs when the enclosing block is left, however it is left. spec ch25. */
+  Defer(Stmt body),
+  /** `schedule f;` — `f` is the schedule target to the end of the enclosing block. spec ch35. */
+  Schedule(Expr target),
+  /** `yield v;`, or `yield;` in a generator yielding `void` — spec ch36. */
+  Yield(Expr? value),
+  /**
+   * `static_if (cond) { … } else { … }` — spec ch31. The condition is evaluated by the compiler
+   * and the branch not taken is dropped from the program, rather than folded away after being checked
+   * like an ordinary `if` with a constant condition.
+   */
+  StaticIf(Expr cond, Stmt[] then, Stmt[] els),
+  /** `static_trap "…";` — a compile error with that message, wherever the program reaches it. */
+  StaticTrap(Expr message),
+  /**
+   * `static_for (init; cond; update) { … }` — unrolled, so the body appears once per turn with the
+   * variable a static in each copy: a `static_if` inside is decided per turn.
+   */
+  StaticFor(Stmt? init, Expr? cond, Stmt? update, Stmt[] body),
+  /**
+   * `static T name = e;` in a function — spec ch27. Visible throughout its block, before its
+   * declaration as after, and computed by dependency order rather than when execution reaches it.
+   */
+  StaticLocal(Ty type, i32 nameTok, Expr init),
+}
+
+// ── Declarations ──────────────────────────────────────────────────────────────
+
+/** `import { a, b as c } from "./m.wac"` — one item. */
+export struct ImportItem {
+  i32 nameTok;
+  /** The same token as `nameTok` when there is no `as`. */
+  i32 aliasTok;
+}
+
+export struct Param {
+  i32 nameTok;
+  Ty type;
+  /** A leading `const`, which forbids writing through the parameter. */
+  bool isConst;
+}
+
+export struct Field {
+  i32 nameTok;
+  Ty type;
+  bool isConst;
+  /** `private i32 cents;` — visible only inside the struct's body. spec ch12. */
+  bool isPrivate;
+  /**
+   * `i32 retries = 3;` — the field's initialiser, which gives it a default (spec ch12
+   * `§wac-field-initialiser-default-28c4ffw`). Evaluated at each construction that leaves the field out.
+   */
+  Expr? init;
+}
+
+export struct Method {
+  i32 nameTok;
+  Ty returnType;
+  Param[] params;
+  Stmt[] body;
+  bool isOverride;
+  /**
+   * The `override` keyword's own token, or -1 when there is none.
+   *
+   * A method has no position of its own — a diagnostic about one names its return type, which is
+   * where the declaration starts. `override` is the exception: *"'override' on 'foo' but no parent
+   * method to override"* names the keyword, because the keyword is the part that is wrong.
+   */
+  i32 overrideTok;
+  /** A method without `this` is static. */
+  bool hasThis;
+  bool thisConst;
+  /**
+   * The method's **own** type parameters, empty for almost every method.
+   *
+   * A struct's letters are in scope already; these are the ones a method introduces for itself —
+   * `Pending<U> then<U>(fn<U(T)> f)`, where `U` appears only in the callback's return and so cannot
+   * come from the owner. Inferred at the call site like a generic function's, never written.
+   *
+   * **Appended last**, because `Method` is built positionally in two places and a field inserted
+   * beside `hasThis`/`thisConst` — both `bool` — would land in the wrong slot with the types still
+   * agreeing.
+   */
+  i32[] typeParams;
+  /**
+   * Declared `async` — `design/lang/0014` D3, where the return type is what the *body* answers
+   * and the caller receives a `Pending<T>` of it.
+   *
+   * Appended last for the reason `typeParams` above was, and the hazard is sharper here: this is
+   * a third `bool` and the two beside it are `hasThis` and `thisConst`, so a slot inserted among
+   * them would typecheck and mean something else.
+   */
+  bool isAsync;
+  /**
+   * `private` — visible only inside its type's body. spec ch12, ch13. Appended last, for the
+   * reason `typeParams` gives: three `bool`s already sit together here.
+   */
+  bool isPrivate;
+  /**
+   * `virtual` — a subtype may override it, and a call dispatches on the receiver's runtime type
+   * (spec ch12 `§wac-virtual-dispatch-a4xhpib`). Appended last, as every field since `typeParams`.
+   */
+  bool isVirtual;
+}
+
+/**
+ * The left side of `matches` — a match arm's pattern. spec ch25.
+ *
+ * Two shapes. `Rgb p` is a **type and a name**: `type` is set and `nameTok` binds the value at that
+ * type when it is one. `Ok(v)` and `Err(is NotFound)` are a **variant and its payload**: `variantTok`
+ * names it, and each payload slot either binds a name (`slotNames[i]`) or tests the payload value
+ * (`slotTests[i]`, with `slotNames[i]` -1) — and a variant with no payload has no slots.
+ */
+export struct Pattern {
+  Ty? type;
+  i32 nameTok;
+  i32 variantTok;
+  i32[] slotNames;
+  Ty?[] slotTests;
+  i32 line;
+  i32 col;
+  /**
+   * Whether the variant was written with parentheses. `A` ignores the payload whatever it is (spec ch13
+   * `[§enum-match-ignore]`) and `A()` says there is none, which an empty `slotNames` cannot tell apart.
+   */
+  bool parens;
+}
+
+/** One variant of an `enum` declaration. Payload fields are shaped like params. */
+export struct Variant {
+  i32 nameTok;
+  Param[] fields;
+}
+
+export struct Decl {
+  DeclKind kind;
+  i32 line;
+  i32 col;
+}
+
+export enum DeclKind {
+  /**
+   * `prefixTok` is the bare word in `import { Read } from core;` and -1 for an ordinary quoted
+   * import, where `pathTok` is the string instead. Exactly one of the two is set: `core` is not a
+   * path, so there is nothing to quote and nothing to resolve it against.
+   */
+  Import(i32 pathTok, i32 prefixTok, ImportItem[] items),
+  /**
+   * `export { a, b as c };` and `export { a, b as c } from "./m.wac";` — spec ch02.
+   *
+   * Each item's `nameTok` is what it names and `aliasTok` what it is exported as. `pathTok` is the
+   * specifier of a re-export, and -1 for a list naming what this module can already see.
+   */
+  ExportList(i32 pathTok, ImportItem[] items),
+  /**
+   * `typeParams` are the name tokens of `<T, U>` after the declaration's name, empty when there are
+   * none. A generic function, struct or enum is the same declaration with those recorded.
+   */
+  Func(i32 nameTok, Ty returnType, Param[] params, Stmt[] body, bool exported,
+       i32[] typeParams, bool isAsync),
+  /** `parentTok` is -1 when the struct has no parent. */
+  StructDecl(i32 nameTok, i32 parentTok, Field[] fields, Method[] methods,
+             bool exported, bool isConst, i32[] typeParams),
+  /**
+   * An enum's methods are held and not printed, exactly as the reference holds them: `Option<T>` has
+   * six, and a parser that stopped at the first one could not read the file at all.
+   */
+  EnumDecl(i32 nameTok, Variant[] variants, bool exported, Method[] methods,
+           i32[] typeParams),
+  /** `[export] static <type> <name> = <expr>;` at file scope. */
+  StaticDecl(i32 nameTok, Ty type, Expr init, bool exported),
+  /** `[export] symbol name;` — a declared identity that can name a member. spec ch21. */
+  SymbolDecl(i32 nameTok, bool exported),
+  /**
+   * `type Name<…> = T;` or `type Name<…> { … }` — spec ch30. A plain alias, or `type(e)` in
+   * `alias`, or a body run statically whose returned `typeref` is the type, with the type parameters
+   * in scope. Exactly one of `alias` and `body` says what the type is: `body` is empty for an alias.
+   */
+  TypeDecl(i32 nameTok, i32[] typeParams, Ty? alias, Stmt[] body, bool exported),
+}
+
+export struct Program {
+  Decl[] decls;
+}
+
+/** A run of JSX text, after the whitespace rule has been applied to it. */
+export struct JsxSpan {
+  i32 from;
+  i32 to;
+
+  bool isEmpty(const this) { return this.to <= this.from; }
+}
+
+/**
+ * What a run of JSX text between two tags *means*, as a span of the source.
+ *
+ * **Trimmed at an end only where the whitespace there contains a newline.** A line break is layout —
+ * the indentation of markup written over several lines — and a space is content: `<h1>hello {who}</h1>`
+ * says "hello world", and a rule that trimmed both ends of every run said "helloworld". A renderer
+ * found that in its first line of output, which is what writing one was for.
+ *
+ * It lives here rather than in the emitter because the parser needs the same rule to answer a
+ * different question: a run that this leaves empty is not a child at all, so the whitespace between
+ * two elements on separate lines adds nothing and the space in `<b>a</b> <b>b</b>` is a `Text(" ")`.
+ * Two copies of the rule would answer those two questions differently on the first day one changed.
+ *
+ * (Written as a loop over bytes rather than with a helper predicate because `u8` is packed and
+ * cannot be a parameter type.)
+ */
+export JsxSpan jsxTrim(u8[] src, i32 startOff, i32 endOff) {
+  i32 from = startOff;
+  i32 to = endOff;
+
+  i32 lead = from;
+  bool leadBreaks = false;
+  while (lead < to
+         && (src[lead] == ' ' || src[lead] == '\n' || src[lead] == '\r' || src[lead] == '\t')) {
+    if (src[lead] == '\n') { leadBreaks = true; }
+    lead = lead + 1;
+  }
+  if (leadBreaks) { from = lead; }
+
+  i32 tail = to;
+  bool tailBreaks = false;
+  while (tail > from
+         && (src[tail - 1] == ' ' || src[tail - 1] == '\n' || src[tail - 1] == '\r'
+             || src[tail - 1] == '\t')) {
+    if (src[tail - 1] == '\n') { tailBreaks = true; }
+    tail = tail - 1;
+  }
+  if (tailBreaks) { to = tail; }
+
+  return JsxSpan(from, to);
+}

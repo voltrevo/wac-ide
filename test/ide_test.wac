@@ -1,0 +1,111 @@
+// The IDE's parts that need no browser: diagnostics, colours, the finder, importing, the checker's messages.
+
+import { Diag, errorCount, inFile, parseWire } from "../src/diag.wac";
+import { Span, classOf, spansOf } from "../src/highlight.wac";
+import { commonTop, ignored, projectName } from "../src/store.wac";
+import { Inbox, Outcome, framed, num, putMessage, tabbed } from "../src/checker.wac";
+import { Doc, dirty, newDoc, retext } from "../src/editor.wac";
+import { score } from "../src/ide.wac";
+
+export string test_diagnostics_read_from_the_wire() {
+  string wire = "projects/p/a.wac\t3\t7\tcheck\tunknown name\t`x` is not declared\tdeclare it\t1\n"
+              + "projects/p/b.wac\t1\t1\tlint\tunused import\t\t\t4\twarning\t0\n"
+              + "too\tshort\n";
+  Diag[] ds = parseWire(wire);
+  if (ds.len() != 2) { return "count: \{ds.len()}"; }
+  if (ds[0].file != "projects/p/a.wac" || ds[0].line != 3 || ds[0].col != 7 || ds[0].message != "unknown name") { return "first"; }
+  if (ds[0].note != "`x` is not declared" || ds[0].hint != "declare it" || ds[0].warning) { return "first's note"; }
+  if (!ds[1].warning || ds[1].width != 4) { return "second"; }
+  if (errorCount(ds) != 1 || inFile(ds, "projects/p/b.wac").len() != 1) { return "counting"; }
+  return "";
+}
+
+string coloured(string src) {
+  Span[] sp = spansOf(src);
+  string out = "";
+  for (i32 i = 0; i < sp.len(); i++) { out = out + sp[i].cls + "[" + src.slice(sp[i].start, sp[i].end) + "]"; }
+  return out;
+}
+
+export string test_colours_come_from_the_lexer() {
+  string a = coloured("// note\nexport i32 f(Vec<string> v) { return 0x1F; } /* x */");
+  if (a != "c[// note]k[export]t[i32]y[Vec]t[string]k[return]n[0x1F]c[/* x */]") { return a; }
+  // An interpolated string is one colour, braces aside; a character is a string too.
+  string b = coloured("string s = \"a \\{n} b\"; u8 c = 'x';");
+  if (b != "t[string]s[\"]s[a \\{]s[ b\"]t[u8]s['x']") { return b; }
+  // `//` inside a string is not a comment.
+  string c = coloured("string u = \"http://x\";");
+  if (c != "t[string]s[\"http://x\"]") { return c; }
+  if (classOf("while") != "k" || classOf("==") != "" || classOf("ident") != "") { return "classes"; }
+  return "";
+}
+
+export string test_a_document_knows_its_lines() {
+  Doc d = newDoc("projects/p/x.wac");
+  retext(d, "ab\n\nlonger line\nz");
+  if (d.starts.len() != 4 || d.starts[2] != 4 || d.widest != 11) { return "\{d.starts.len()} \{d.widest}"; }
+  d.loaded = true;
+  d.saved = "ab";
+  if (!dirty(d)) { return "dirty"; }
+  Doc t = newDoc("notes.txt");
+  retext(t, "if x // not wac");
+  if (t.spans.len() != 0) { return "only .wac is coloured"; }
+  return "";
+}
+
+export string test_the_finder_ranks_names_over_paths() {
+  if (score("packages/wacc/src/emit.wac", "emit") <= score("packages/emitter/src/zzz.wac", "emit")) { return "a match in the file's own name wins"; }
+  if (score("src/main.wac", "mw") < 0) { return "letters in order match"; }
+  if (score("src/main.wac", "wm") >= 0) { return "letters out of order do not"; }
+  if (score("a/json.wac", "json") <= score("a/j_s_o_n.wac", "json")) { return "letters together beat letters apart"; }
+  return "";
+}
+
+export string test_imports_lose_what_an_editor_does_not_want() {
+  if (!ignored("wac/.git/HEAD") || !ignored("node_modules/x") || ignored("src/git.wac")) { return "ignored"; }
+  if (commonTop(["wac-master/a.wac", "wac-master/b/c.wac"]) != "wac-master") { return "one folder"; }
+  if (commonTop(["a.wac", "b/c.wac"]) != "" || commonTop(["x/a.wac", "y/b.wac"]) != "") { return "no one folder"; }
+  if (projectName("wac.tar.gz", ["wac"]) != "wac 2" || projectName("hello.zip", string[]()) != "hello") { return "names"; }
+  return "";
+}
+
+export string test_the_checkers_messages_survive_being_cut_up() {
+  u8[] put = putMessage("projects/p/a.wac", "line one\nline two\n".toBytes());
+  u8[] answer = framed(Outcome("check", 7, 3, 120, "x\t1\t1\tcheck\tbad\n".toBytes()));
+  u8[] all = u8[].filled(put.len() + answer.len(), 0 as u8);
+  for (i32 i = 0; i < put.len(); i++) { all[i] = put[i]; }
+  for (i32 i = 0; i < answer.len(); i++) { all[put.len() + i] = answer[i]; }
+  // Delivered a few bytes at a time, as a pipe may.
+  Inbox in = Inbox.create();
+  i32 at = 0;
+  string[] head = string[]();
+  u8[] body = u8[]();
+  i32 got = 0;
+  while (got < 2) {
+    string? line = in.line();
+    if (line is null) {
+      i32 end = at + 5 < all.len() ? at + 5 : all.len();
+      u8[] piece = u8[].filled(end - at, 0 as u8);
+      for (i32 i = at; i < end; i++) { piece[i - at] = all[i]; }
+      at = end;
+      in.add(piece);
+      continue;
+    }
+    head = tabbed(line!);
+    i32 n = num(head[head.len() - 1]);
+    u8[]? b = in.take(n);
+    while (b is null) {
+      i32 end = at + 5 < all.len() ? at + 5 : all.len();
+      u8[] piece = u8[].filled(end - at, 0 as u8);
+      for (i32 i = at; i < end; i++) { piece[i - at] = all[i]; }
+      at = end;
+      in.add(piece);
+      b = in.take(n);
+    }
+    body = b!;
+    got++;
+    if (got == 1 && (head[0] != "put" || string.fromBytes(body) != "line one\nline two\n")) { return "put: \{head[0]} \{string.fromBytes(body)}"; }
+  }
+  if (head[0] != "check" || num(head[1]) != 7 || num(head[2]) != 3 || string.fromBytes(body) != "x\t1\t1\tcheck\tbad\n") { return "answer"; }
+  return "";
+}
