@@ -8,15 +8,14 @@
 // typing stops, as they are sent.
 
 import { Map, Ticket, Vec, hashString, stringEq } from "core";
-import { Change, FileResult, Sys } from "std";
-import { ElementEvent, MOD_CTRL, MOD_META, Node, Page, Picked, Ref, Ui, html.b, html.button, html.div, html.h1, html.input,
+import { Files, MemoryStore, Sys } from "std";
+import { Desktop, ElementEvent, MOD_CTRL, MOD_META, Node, Page, Picked, Ref, Ui, html.b, html.button, html.div, html.h1, html.input,
          html.label, html.p, html.span, html.style } from "web";
-import { Fs } from "../vendor/wac/packages/fs/src/fs.wac";
 import { Checker, Outcome, serve } from "./checker.wac";
 import { Diag, errorCount, inFile, parseWire } from "./diag.wac";
 import { Doc, Editor, dirty, lineAt, newDoc, offsetOf, retext, u16Of } from "./editor.wac";
 import { Info, parseInfo } from "./info.wac";
-import { Entry, Incoming, Unpacked, PROJECTS, commonTop, ignored, join, leafOf, list, lowerOf, parentOf, projectName,
+import { Entry, Got, Incoming, Unpacked, PROJECTS, commonTop, ignored, join, leafOf, list, lowerOf, parentOf, projectName,
          projects, read, remove, rootOf, store, unpack, walk, write } from "./store.wac";
 import { css, icon } from "./style.wac";
 
@@ -30,8 +29,12 @@ export async i32 checker(Sys sys) { return await serve(sys); }
 // ── what the page holds ─────────────────────────────────────────────────────
 
 struct App {
-  Fs fs;
+  Files fs;
   bool persistent;
+  /** The folder of projects: `PROJECTS` on its own, or the folder wac's desktop started it with. */
+  string home;
+  /** The desktop that started it, which a build is noted on; `null` on a page of its own. */
+  Desktop? desk;
   Checker? check;
   /** The open project, or "" for the projects screen. */
   string project;
@@ -74,8 +77,8 @@ struct App {
   string checkerNote;
 }
 
-App newApp(Fs fs, bool persistent) {
-  return App(fs, persistent, null, "", string[](), Map.create(hashString, stringEq), Map.create(hashString, stringEq), "",
+App newApp(Files fs, bool persistent) {
+  return App(fs, persistent, PROJECTS, null, null, "", string[](), Map.create(hashString, stringEq), Map.create(hashString, stringEq), "",
              Vec.create(), -1, Diag[](), 0, "", "", false, false, true, 0, false, "", 0, string[](), false, 0, null, 0, 0, 0, "", "", "", "", "", "");
 }
 
@@ -83,11 +86,19 @@ Doc? activeDoc(App a) { return a.active >= 0 && a.active < a.docs.len() ? a.docs
 
 /** A path on the disk, relative to the open project. */
 string rel(App a, string path) {
-  string root = rootOf(a.project) + "/";
+  string root = rootOf(a.home, a.project) + "/";
   return path.len() > root.len() && path.slice(0, root.len()) == root ? path.slice(root.len(), path.len()) : path;
 }
 
 bool isWac(string path) { return path.len() > 4 && path.slice(path.len() - 4, path.len()) == ".wac"; }
+
+/** Milliseconds by the page's clock, or 0 where it has none. */
+async i64 nowOf(Page page) {
+  match (await page.sys.clock().nowMillis()) {
+    Ok(ms): { return ms; }
+    Err(why): { return 0 as i64; }
+  }
+}
 
 // ── remembering where we were ───────────────────────────────────────────────
 
@@ -109,10 +120,10 @@ string[] linesOf(string s) {
 }
 
 async void start(Page page, App a, fn<void()> bump) {
-  a.projects = await projects(a.fs);
-  FileResult st = await read(a.fs, STATE);
+  a.projects = await projects(a.fs, a.home);
+  Got st = await read(a.fs, STATE);
   bump();
-  Checker c = await Checker.start(a.fs, page.sys.cli, page.sys.core, a.persistent);
+  Checker c = await Checker.start(page.sys, a.fs, a.persistent);
   a.check = c;
   a.checkerNote = c.note;
   if (st.ok) {
@@ -137,21 +148,21 @@ async void openProject(App a, string name, fn<void()> bump) {
   a.active = -1;
   a.dirs = Map.create(hashString, stringEq);
   a.open = Map.create(hashString, stringEq);
-  a.open.set(rootOf(name), true);
+  a.open.set(rootOf(a.home, name), true);
   a.diags = Diag[]();
   a.diagSeq++;
   a.checkSummary = "";
-  a.selected = rootOf(name);
+  a.selected = rootOf(a.home, name);
   a.index = string[]();
   if (a.check is not null) { a.check!.reset(); }
-  await listDir(a, rootOf(name), bump);
+  await listDir(a, rootOf(a.home, name), bump);
   // The finder's list of every file: written at import, made by walking the project otherwise.
-  FileResult idx = await read(a.fs, "ide/\{name}.files");
+  Got idx = await read(a.fs, "ide/\{name}.files");
   if (idx.ok) {
     a.index = linesOf(string.fromBytes(idx.bytes));
   } else {
     Vec<string> all = Vec.create();
-    await walk(a.fs, rootOf(name), "", all);
+    await walk(a.fs, rootOf(a.home, name), "", all);
     a.index = all.toArray();
     await write(a.fs, "ide/\{name}.files", joinLines(a.index).toBytes());
   }
@@ -171,9 +182,9 @@ async void listDir(App a, string dir, fn<void()> bump) {
 }
 
 async void deleteProject(App a, string name, fn<void()> bump) {
-  await remove(a.fs, rootOf(name));
+  await remove(a.fs, rootOf(a.home, name));
   await remove(a.fs, "ide/\{name}.files");
-  a.projects = await projects(a.fs);
+  a.projects = await projects(a.fs, a.home);
   a.note = "Deleted \{name}";
   bump();
 }
@@ -183,18 +194,18 @@ static string HELLO = """
 import { Sys } from "std";
 
 export i32 main(Sys sys) {
-  sys.core.log("hello from wac");
+  sys.stdout().line("hello from wac");
   return 0;
 }
 """;
 
 async void newProject(App a, fn<void()> bump) {
   string name = projectName("hello", a.projects);
-  await write(a.fs, join(rootOf(name), "main.wac"), HELLO.toBytes());
+  await write(a.fs, join(rootOf(a.home, name), "main.wac"), HELLO.toBytes());
   await write(a.fs, "ide/\{name}.files", "main.wac\n".toBytes());
-  a.projects = await projects(a.fs);
+  a.projects = await projects(a.fs, a.home);
   await openProject(a, name, bump);
-  await openFile(a, join(rootOf(name), "main.wac"), bump);
+  await openFile(a, join(rootOf(a.home, name), "main.wac"), bump);
   wantCheck(a, bump);
 }
 
@@ -249,13 +260,13 @@ async void importBatch(Page page, App a, Vec<Picked> batch, fn<void()> bump) {
     name = projectName(top != "" ? top : "project", a.projects);
   }
   if (files.len() == 0) { a.importing = ""; a.error = "There was nothing to import."; bump(); return; }
-  i64 t0 = page.sys.core.nowMillis().wait();
+  i64 t0 = await nowOf(page);
   // Passed in through fixed locals: a lambda inside an `await` that captured the reassigned ones made
   // the emitter lose a temporary (see docs/wac-wishlist.md).
   string called = name;
   i32 total = files.len();
   fn<void(i32)> progress = (i32 done) => { a.importing = "Importing \{called}: \{done} of \{total} files…"; bump(); };
-  i32 n = await store(a.fs, name, files, progress);
+  i32 n = await store(a.fs, a.home, name, files, progress);
   // The finder's index, written once rather than walked for.
   string[] paths = string[].filled(files.len(), "");
   for (i32 i = 0; i < files.len(); i++) { paths[i] = files[i].path; }
@@ -263,8 +274,8 @@ async void importBatch(Page page, App a, Vec<Picked> batch, fn<void()> bump) {
   for (i32 i = 0; i < paths.len(); i++) { if (top != "") { paths[i] = paths[i].slice(top.len() + 1, paths[i].len()); } }
   await write(a.fs, "ide/\{name}.files", joinLines(paths).toBytes());
   a.importing = "";
-  a.projects = await projects(a.fs);
-  a.note = "Imported \{n} files as \{name} in \{(page.sys.core.nowMillis().wait() - t0) / 1000} s";
+  a.projects = await projects(a.fs, a.home);
+  a.note = "Imported \{n} files as \{name} in \{(await nowOf(page) - t0) / 1000} s";
   await openProject(a, name, bump);
 }
 
@@ -288,7 +299,7 @@ async void openFile(App a, string path, fn<void()> bump) {
   a.selected = path;
   a.focusSeq++;
   bump();
-  FileResult f = await read(a.fs, path);
+  Got f = await read(a.fs, path);
   if (!f.ok) { a.error = "\{rel(a, path)} could not be read: \{f.error}"; closeTab(a, a.docs.len() - 1); bump(); return; }
   if (binary(f.bytes)) {
     d.binary = true;
@@ -318,8 +329,8 @@ async void flush(App a, fn<void()> bump) {
     if (!dirty(d)) { continue; }
     string text = d.text;
     if (a.check is not null) { a.check!.put(d.path, text.toBytes()); }
-    Change c = await write(a.fs, d.path, text.toBytes());
-    if (c.ok()) { d.saved = text; } else { a.error = "\{rel(a, d.path)} could not be saved: \{c.message}"; }
+    string why = await write(a.fs, d.path, text.toBytes());
+    if (why == "") { d.saved = text; } else { a.error = "\{rel(a, d.path)} could not be saved: \{why}"; }
     any = true;
   }
   if (any) { wantCheck(a, bump); }
@@ -334,10 +345,10 @@ async void newFile(App a, string name, fn<void()> bump) {
   bool isDir = a.dirs.get(dir) is not null;
   if (!isDir) { dir = parentOf(dir); }
   string path = join(dir, name);
-  FileResult there = await read(a.fs, path);
+  Got there = await read(a.fs, path);
   if (there.ok) { a.error = "\{rel(a, path)} already exists"; bump(); return; }
-  Change c = await write(a.fs, path, (isWac(path) ? "// \{leafOf(path)}\n" : "").toBytes());
-  if (!c.ok()) { a.error = c.message; bump(); return; }
+  string why = await write(a.fs, path, (isWac(path) ? "// \{leafOf(path)}\n" : "").toBytes());
+  if (why != "") { a.error = why; bump(); return; }
   a.open.set(dir, true);
   await listDir(a, dir, bump);
   Vec<string> idx = Vec.fromArray(a.index);
@@ -392,8 +403,21 @@ async void build(Page page, App a, fn<void()> bump) {
   a.checking = false;
   if (o.kind == "wasm") {
     string stem = leafOf(d!.path).slice(0, leafOf(d!.path).len() - 4);
-    page.download("\{stem}.wasm", o.bytes);
-    a.note = "Built \{stem}.wasm — \{o.bytes.len() / 1024} KB from \{o.files} files in \{o.ms} ms";
+    string made = "\{o.bytes.len() / 1024} KB from \{o.files} files in \{o.ms} ms";
+    if (a.desk is null) {
+      page.download("\{stem}.wasm", o.bytes);
+      a.note = "Built \{stem}.wasm — \{made}";
+    } else {
+      // **On wac's desktop the module goes beside its source**, where Files shows it and a double-click runs it.
+      string out = join(parentOf(d!.path), "\{stem}.wasm");
+      string why = await write(a.fs, out, o.bytes);
+      if (why == "") {
+        a.note = "Built \{rel(a, out)} — \{made}";
+        await listDir(a, parentOf(d!.path), bump);
+      } else {
+        a.error = "\{rel(a, out)} could not be written: \{why}";
+      }
+    }
   } else {
     a.note = "";
     a.error = "\{leafOf(d!.path)} did not build: \{string.fromBytes(o.bytes)}";
@@ -517,7 +541,7 @@ Node finder(App a, Ref field, fn<void()> bump) {
   for (i32 i = 0; i < hs.len(); i++) {
     string p = hs[i];
     rows[i] = <div class={i == a.hit ? "hit on" : "hit"} key={p}
-                   onclick={(ElementEvent e) => { a.finding = false; openFile(a, join(rootOf(a.project), p), bump); }}>
+                   onclick={(ElementEvent e) => { a.finding = false; openFile(a, join(rootOf(a.home, a.project), p), bump); }}>
       {icon(isWac(p) ? "wac" : "file", "sm")}<span>{leafOf(p)}</span><span class="dir">{parentOf(p)}</span></div>;
   }
   return <div class="veil" onclick={(ElementEvent e) => { a.finding = false; bump(); }}>
@@ -529,7 +553,7 @@ Node finder(App a, Ref field, fn<void()> bump) {
                if (e.value == "ArrowDown") { a.hit++; bump(); }
                else if (e.value == "ArrowUp") { a.hit--; bump(); }
                else if (e.value == "Escape") { a.finding = false; a.focusSeq++; bump(); }
-               else if (e.value == "Enter" && hs.len() > 0) { a.finding = false; openFile(a, join(rootOf(a.project), hs[a.hit]), bump); }
+               else if (e.value == "Enter" && hs.len() > 0) { a.finding = false; openFile(a, join(rootOf(a.home, a.project), hs[a.hit]), bump); }
              }}/>
       <div class="hits">{hs.len() == 0 ? <div class="pnone">No file matches.</div> : Node.Text("")}{rows}</div>
     </div>
@@ -600,7 +624,7 @@ async void jumpTo(App a, string path, i32 line, i32 col, fn<void()> bump) {
   await openFile(a, path, bump);
   Doc? d = activeDoc(a);
   if (d is null || d!.path != path) { return; }
-  while (!d!.loaded && a.check is not null) { await a.check!.core.sleepMillis(20).ticket(); }
+  while (!d!.loaded && a.check is not null) { await a.check!.sleep(20); }
   d!.jumpLine = line;
   d!.jumpByte = offsetOf(d!, line, col);
   d!.jumpSeq++;
@@ -635,7 +659,7 @@ Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
     errs.set(a.diags[i].file, n is null ? 1 : n! + 1);
   }
   Vec<Node> tree = Vec.create();
-  treeRows(a, rootOf(a.project), 0, errs, tree, bump);
+  treeRows(a, rootOf(a.home, a.project), 0, errs, tree, bump);
   Node[] tabs = Node[].filled(a.docs.len(), Node.Text(""));
   Node[] editors = Node[].filled(a.docs.len(), Node.Text(""));
   for (i32 i = 0; i < a.docs.len(); i++) {
@@ -732,7 +756,7 @@ Node home(App a, fn<void()> bump) {
 // ── the page ────────────────────────────────────────────────────────────────
 
 Node Ide(Ui ui, Page page) {
-  App a = ui.memo<App>("", () => newApp(Fs.inMemory(0), false));
+  App a = ui.memo<App>("", () => newApp(MemoryStore.create(page.sys.clock()).asUser("root"), false));
   auto version = ui.state(0);
   auto ready = ui.state(false);
   fn<void()> bump = () => { version.update((i32 v) => v + 1); };
@@ -795,11 +819,21 @@ Node Ide(Ui ui, Page page) {
   </div>;
 }
 
-/** Choose the disk — the browser's storage if it is offered, memory if not — then start. */
+/**
+ * Choose the disk — the browser's storage if it is offered, memory if not — then start. **Started by wac's desktop**
+ * with a folder as its argument, its projects are that folder's folders, on the desktop's disk, where Files and the
+ * Terminal see them too.
+ */
 async void begin(Page page, App a, fn<void()> bump, fn<void()> ready) {
-  Change c = await page.sys.cli.mkdir(PROJECTS, true).ticket();
-  a.persistent = c.ok();
-  a.fs = a.persistent ? Fs.onHost(page.sys.cli, page.sys.core.nowMillis().wait()) : Fs.inMemory(page.sys.core.nowMillis().wait());
+  string[] args = page.sys.args();
+  if (args.len() > 0 && args[0] != "") { a.home = args[0]; }
+  match (await Desktop.of(page.sys)) {
+    Ok(d): { a.desk = d; }
+    Err(why): { }
+  }
+  a.persistent = (await page.sys.files().mkdir(a.home, true)).isOk();
+  a.fs = a.persistent ? page.sys.files() : MemoryStore.create(page.sys.clock()).asUser("root");
+  if (!a.persistent) { await a.fs.mkdir(a.home, true); }
   await start(page, a, bump);
   ready();
   arrivals(page, a, bump);

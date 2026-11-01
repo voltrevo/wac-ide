@@ -20,7 +20,7 @@ checking your code as you type. Built for real projects, up to the wac repositor
 
 ## Trying it
 
-    wac update           # fetch the pinned wac packages, once
+    sh tools/fill-cache.sh   # put the pinned wac and web in wac's package cache, once
     wac task build       # src/ide.wac -> dist/index.html
     wac task serve       # http://localhost:8080
     wac task test        # the parts that need no browser
@@ -30,11 +30,15 @@ Serve it: over http the browser gives it storage, and the checker its own proces
 disk (`file://`) it still works, but keeps nothing after the tab closes, and checks inside the page, so
 typing can pause during a long check.
 
-**Everything is pinned to one wac commit** — the `wac` command should be bootstrapped from it, `wac.json5`
-names it as every wac dependency's `ref`, `wac.lock` agrees, and `vendor/wac/` was copied from it. That
-commit is the head of `ide-queries`, a branch of wac **not yet on GitHub**: four commits on top of wac
-`25a34468` that the IDE needs (the caret in `web`, and `queryIn` in the compiler). They travel with this
-project as `wac-patches/` — see there to build it.
+**Everything is pinned in `wac.lock`**: wac, whose root library brings the compiler (`wacc`) and the `wac`
+command's gathering (`wac`), and `web`, the page and its builder — both on git.voltrevo.com, which answers
+`wac update` 401, so `tools/fill-cache.sh` fetches them with `git`. The `wac` command should be built from the
+pinned wac commit.
+
+**On wac's desktop** (https://git.voltrevo.com/wac-desktop.git) it is a program like the desktop's own apps,
+started with a folder of the desktop's disk as its argument: its projects are that folder's folders, which Files
+and the Terminal see too; what it keeps for itself goes in its own folder; and Build writes the module beside
+its source, where a double-click runs it. On its own, its projects are in `/projects` in the browser's storage.
 
 ## How fast, on the wac repository
 
@@ -62,7 +66,6 @@ Measured in headless Chromium (`tools/ide_scale.js`):
 | `src/store.wac` | projects in the browser's storage: importing, listing, reading, writing |
 | `src/archive.wac`, `src/sniff.wac`, `src/bytes.wac` | zip, tar, gzip and zstd — from the desktop project |
 | `src/style.wac` | the look, light and dark; icons as SVG masks |
-| `vendor/wac/` | wac's compiler and the `wac` command's source gathering, copied by `tools/vendor_wac.py` until wac's root library exports them |
 | `docs/wac-wishlist.md` | what the IDE would like from wac, and the bugs met building it |
 
 - **The editor never scrolls anything itself.** A page cannot read or set a scroll position, so the

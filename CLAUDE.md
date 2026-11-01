@@ -5,19 +5,19 @@ what it would like from wac — keep it current, it is how this project talks to
 
 ## Working agreements
 
-- **Do not push** anywhere unless the owner says so. Commit locally.
-- The owner reviews through files handed over in chat; there is no remote.
+- **The remote is `https://git.voltrevo.com/wac-ide.git`, `master`** (the server's default branch, `main`, is
+  empty). Push finished work through `tools/push.sh`, which checks and tests first; nothing goes to GitHub
+  unless the owner says so.
 - When wac lacks something: work around it here, and add an entry to `docs/wac-wishlist.md` saying what
   it would enable, what the workaround is, and where in wac it lives. Bugs get a minimal reproduction.
 - Comments explain *why*, in full sentences. Match the surrounding style.
 
 ## Building and testing
 
-wac is pinned to the head of wac branch `ide-queries` everywhere: `wac.json5`, `wac.lock`,
-`vendor/wac/VENDORED.md`, and the `wac` command itself. The branch is not on GitHub; `wac-patches/README.md`
-says how to get it. Change them together; `wac task vendor <wac checkout>` re-copies the vendored part.
+wac and `web` are pinned in `wac.json5` and `wac.lock` (change them together), and the `wac` command should be
+built from the wac commit. `wac update` cannot fetch from git.voltrevo.com; `tools/fill-cache.sh` does, with `git`.
 
-    wac task build && wac task test && wac task test:ide
+    sh tools/fill-cache.sh && wac task build && wac task test && wac task test:ide
 
 - `test:ide` drives Chromium with Playwright against `dist/` — build first. It covers http and `file://`.
 - `tools/ide_scale.js` is the measurement against the wac repository (see its header); README's table
@@ -32,7 +32,5 @@ says how to get it. Change them together; `wac task vendor <wac checkout>` re-co
 
 - The page's program runs in a worker: the DOM changes a moment after each event, so browser tests wait.
 - `autofocus` does nothing on an element made after load; focus through a `Ref`.
-- A type reached through `vendor/wac/` and the same type through `from "wac"` are two types. `Fs` comes
-  from vendor/ everywhere.
 - `f64` has only `floor`, `ceil`, `round`, `trunc`. Escapes are the usual few. A block string starts on a
   new line after `"""`.

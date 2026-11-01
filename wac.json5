@@ -1,10 +1,14 @@
 {
+  // The IDE as a package — `import { main, checker } from "ide"` — which wac's desktop builds into its site as one of
+  // its programs.
+  exports: './src/ide.wac',
   imports: {
-    // wac's packages, as one dependency — `import { gzip.inflateResult } from "wac"`.
-    wac: { git: 'https://github.com/voltrevo/wac', ref: '5d15f2ed6f55ef855afa36df06ff0cc6e9fa825a' },
-    // The page a program is handed.
-    web: { git: 'https://github.com/voltrevo/wac', ref: '5d15f2ed6f55ef855afa36df06ff0cc6e9fa825a', subdir: './packages/web' },
+    // wac's packages, as one dependency — `import { wacc.diagnoseGraphIn, gzip.inflateResult } from "wac"` — the
+    // compiler and the `wac` command's gathering among them, which this project used to copy into vendor/.
+    wac: { git: 'https://git.voltrevo.com/wac.git', ref: 'c405f554da08b10461211e3cb9a934d746cc1e10' },
+    // The page a program is handed — `import { Page, Desktop } from "web"` — a repository of its own since 2026-10-29.
+    web: { git: 'https://git.voltrevo.com/web.git', ref: '0abc650422e5de12416d51f4dcfbeb4bb7223ac6' },
     // The page builder `build.wac` calls.
-    webbuild: { git: 'https://github.com/voltrevo/wac', ref: '5d15f2ed6f55ef855afa36df06ff0cc6e9fa825a', subdir: './packages/web/tools' },
+    webbuild: { git: 'https://git.voltrevo.com/web.git', ref: '0abc650422e5de12416d51f4dcfbeb4bb7223ac6', subdir: './tools' },
   },
 }

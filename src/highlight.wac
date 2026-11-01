@@ -10,7 +10,7 @@
 // not change.
 
 import { Vec } from "core";
-import { lexTokensOf, lexTokenStride, tokenKindName } from "../vendor/wac/packages/wacc/src/api.wac";
+import { wacc.lexTokensOf, wacc.lexTokenStride, wacc.tokenKindName } from "wac";
 
 /** A coloured stretch: bytes `start` to `end`, of class `cls` — "k", "s", "n", "c", "l", "t". */
 export struct Span {

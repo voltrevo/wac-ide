@@ -20,16 +20,18 @@
 //                      query\t<id>\t<file>\t<offset>\n  what the name at byte <offset> of <file> is
 //     checker → page   <kind>\t<id>\t<files>\t<ms>\t<n>\n<n bytes>
 //
-// where the answer's kind is `check` (the bytes are the diagnostics wire), `query` (wacc's `queryIn`
-// answer: the name's type, where it is declared, and its doc), `wasm` (a module) or `error`
-// (why there is neither). A page opened from a file cannot start workers from its own, so there the
+// where the answer's kind is `check` (the bytes are the diagnostics wire), `query` (what wacc's `factsAt`
+// says of the name: its type, where it is declared, and its doc — as `info.wac` reads it), `wasm` (a module) or
+// `error` (why there is neither). A page opened from a file cannot start workers from its own, so there the
 // same `Engine` runs inside the page instead — slower to type beside, and otherwise the same.
+//
+// **The checker is handed this program's files** — `Procs.spawnSelf` with them as its authority — so on wac's
+// desktop, where they are what the desktop granted, it reads what the IDE may read, and no more.
 
-import { Buf, Map, Ticket, Vec, hashString, stringEq } from "core";
-import { Cli, Core, FileResult, GRANT_READ, HostChild, Sys } from "std";
-import { Fs } from "../vendor/wac/packages/fs/src/fs.wac";
-import { ReadCache, Sources, exactly, gatherNeeded, gatherWith, resOf } from "../vendor/wac/packages/wac/src/sources.wac";
-import { blockedFilesIn, diagnoseGraphIn, emitFilesIn, queryIn } from "../vendor/wac/packages/wacc/src/api.wac";
+import { Map, Ticket, Vec, hashString, stringEq } from "core";
+import { Authority, Child, Clock, Env, Files, Input, Launch, Output, Sys } from "std";
+import { wac.ReadCache, wac.Sources, wac.exactly, wac.gatherNeeded, wac.gatherWith, wac.resOf } from "wac";
+import { wacc.PositionFacts, wacc.blockedFilesIn, wacc.diagnoseGraphIn, wacc.emitFilesIn, wacc.factsAt } from "wac";
 
 /** What a check or a build came to. */
 export struct Outcome {
@@ -44,16 +46,33 @@ export struct Outcome {
 
 // ── the engine: the same in the checker's process and, as a fallback, in the page ──
 
+/** Milliseconds by `clock`, or 0 where it has none. */
+async i64 now(Clock clock) {
+  match (await clock.nowMillis()) {
+    Ok(ms): { return ms; }
+    Err(why): { return 0 as i64; }
+  }
+}
+
+/** What `factsAt` says, as the lines `info.wac` reads: the token, its type, its declaration, its doc. */
+export string factsLines(PositionFacts f) {
+  if (f.start < 0) { return ""; }
+  string out = "token\t\{f.start}\t\{f.end}\ntype\t\{f.type}\n";
+  if (f.defPath != "") { out = out + "def\t\{f.defPath}\t\{f.defLine}\t\{f.defCol}\t\{f.defKind}\nsig\t\{f.signature}\n"; }
+  for (i32 i = 0; i < f.doc.len(); i++) { out = out + "doc\t\{f.doc[i]}\n"; }
+  return out;
+}
+
 export struct Engine {
-  Fs fs;
-  Cli cli;
-  Core core;
+  Files fs;
+  Env env;
+  Clock clock;
   ReadCache cache;
 
-  Engine create(Fs fs, Cli cli, Core core) { return Engine(fs, cli, core, ReadCache.create()); }
+  Engine create(Files fs, Env env, Clock clock) { return Engine(fs, env, clock, ReadCache.create()); }
 
   void put(this, string path, u8[] bytes) {
-    this.cache.files.set(path, FileResult.of(true, bytes, "", 0));
+    this.cache.files.set(path, bytes);
     this.cache.texts.remove(path);
     this.cache.specs.remove(path);
   }
@@ -74,26 +93,26 @@ export struct Engine {
       offset = num(entry.slice(tab + 1, entry.len()));
       entry = entry.slice(0, tab);
     }
-    i64 t0 = this.core.nowMillis().wait();
+    i64 t0 = await now(this.clock);
     bool build = kind == "build";
-    Sources s = build ? await gatherNeeded(this.fs, this.cli, entry, this.cache)
-                      : await gatherWith(this.fs, this.cli, entry, false, this.cache);
-    i32 ms = (this.core.nowMillis().wait() - t0) as! i32;
+    Sources s = build ? await gatherNeeded(this.fs, this.env, entry, this.cache)
+                      : await gatherWith(this.fs, this.env, entry, false, this.cache);
+    i32 ms = (await now(this.clock) - t0) as! i32;
     if (s.missing != "" || s.why != "") {
       return Outcome("error", id, s.n, ms, (s.why != "" ? s.why : "cannot read \{s.missing}").toBytes());
     }
     string[] paths = exactly(s.paths, s.n);
     string[] texts = exactly(s.texts, s.n);
     if (kind == "query") {
-      string answer = queryIn(paths, texts, resOf(s), entry, offset);
-      return Outcome("query", id, s.n, (this.core.nowMillis().wait() - t0) as! i32, answer.toBytes());
+      string answer = factsLines(factsAt(paths, texts, resOf(s), entry, offset));
+      return Outcome("query", id, s.n, (await now(this.clock) - t0) as! i32, answer.toBytes());
     }
     if (!build) {
       string wire = diagnoseGraphIn(paths, texts, resOf(s), entry);
-      return Outcome("check", id, s.n, (this.core.nowMillis().wait() - t0) as! i32, wire.toBytes());
+      return Outcome("check", id, s.n, (await now(this.clock) - t0) as! i32, wire.toBytes());
     }
     u8[] wasm = emitFilesIn(paths, texts, resOf(s), entry);
-    i32 total = (this.core.nowMillis().wait() - t0) as! i32;
+    i32 total = (await now(this.clock) - t0) as! i32;
     if (wasm.len() == 0) {
       string why = blockedFilesIn(paths, texts, resOf(s), entry);
       if (why == "") {
@@ -179,29 +198,36 @@ export u8[] putMessage(string path, u8[] bytes) {
   return out;
 }
 
+/** More of `input` into `in`: false at its end, or when it failed. */
+async bool fill(Input input, Inbox in) {
+  match (await input.chunk()) {
+    Ok(r): {
+      match (r) {
+        Data(b): { in.add(b); return true; }
+        default: { return false; }
+      }
+    }
+    Err(why): { return false; }
+  }
+}
+
 /** The checker's process: messages in, answers out, until its input ends. */
 export async i32 serve(Sys sys) {
-  Engine e = Engine.create(Fs.onHost(sys.cli, 0), sys.cli, sys.core);
+  Engine e = Engine.create(sys.files(), sys.env(), sys.clock());
   Inbox in = Inbox.create();
+  Input input = sys.stdin();
+  Output out = sys.stdout();
   while (true) {
     string? line = in.line();
     if (line is null) {
-      match (await sys.cli.readChunk().ticket()) {
-        Data(b): { in.add(b); }
-        End: { return 0; }
-        Failed(why): { return 1; }
-      }
+      if (!(await fill(input, in))) { return 0; }
       continue;
     }
     string[] f = tabbed(line!);
     if (f[0] == "put" && f.len() >= 3) {
       u8[]? body = in.take(num(f[2]));
       while (body is null) {
-        match (await sys.cli.readChunk().ticket()) {
-          Data(b): { in.add(b); }
-          End: { return 0; }
-          Failed(why): { return 1; }
-        }
+        if (!(await fill(input, in))) { return 0; }
         body = in.take(num(f[2]));
       }
       e.put(f[1], body!);
@@ -210,9 +236,9 @@ export async i32 serve(Sys sys) {
     } else if (f[0] == "reset") {
       e.reset();
     } else if ((f[0] == "check" || f[0] == "build") && f.len() >= 3) {
-      sys.cli.write(framed(await e.run(f[0], num(f[1]), f[2])));
+      await out.write(framed(await e.run(f[0], num(f[1]), f[2])));
     } else if (f[0] == "query" && f.len() >= 4) {
-      sys.cli.write(framed(await e.run("query", num(f[1]), "\{f[2]}\t\{f[3]}")));
+      await out.write(framed(await e.run("query", num(f[1]), "\{f[2]}\t\{f[3]}")));
     }
   }
 }
@@ -221,10 +247,9 @@ export async i32 serve(Sys sys) {
 
 export struct Checker {
   /** The process, when there is one; null when the engine runs in the page instead. */
-  HostChild? kid;
+  Child? kid;
   Engine? local;
-  Cli cli;
-  Core core;
+  Clock clock;
   Inbox in;
   i32 nextId;
   /** A request is out: the next waits for its answer, since answers are read off one stream. */
@@ -236,39 +261,43 @@ export struct Checker {
    * is a page opened from a file: there a worker cannot start one of its own, and asking never answers
    * (the browser's refusal is thrown inside the host), so it is not asked.
    */
-  async Checker start(Fs fs, Cli cli, Core core, bool spawn) {
+  async Checker start(Sys sys, Files fs, bool spawn) {
     string why = "a page opened from a file cannot start a process";
     if (spawn) {
-      HostChild k = await cli.spawnSelf([("checker").toBytes()], GRANT_READ, "", 0, false).ticket();
-      if (k.handle >= 0) { return Checker(k, null, cli, core, Inbox.create(), 1, false, ""); }
-      why = k.error;
+      match (await sys.procs().spawnSelf(["checker"], Authority(fs, null, sys.env(), null), Launch.plain())) {
+        Ok(k): { return Checker(k, null, sys.clock(), Inbox.create(), 1, false, ""); }
+        Err(e): { why = "\{e}"; }
+      }
     }
-    return Checker(null, Engine.create(fs, cli, core), cli, core, Inbox.create(), 1, false,
+    return Checker(null, Engine.create(fs, sys.env(), sys.clock()), sys.clock(), Inbox.create(), 1, false,
                    "Checking runs in the page here (\{why}), so typing may pause while it does.");
   }
 
   /** A file's contents now: what the next check sees, saved or not. */
   void put(this, string path, u8[] bytes) {
     if (this.local is not null) { this.local!.put(path, bytes); return; }
-    this.cli.send(this.kid!.handle, putMessage(path, bytes));
+    this.kid!.input().write(putMessage(path, bytes));
   }
 
   void forget(this, string path) {
     if (this.local is not null) { this.local!.forget(path); return; }
-    this.cli.send(this.kid!.handle, "forget\t\{path}\n".toBytes());
+    this.kid!.input().write("forget\t\{path}\n".toBytes());
   }
 
   void reset(this) {
     if (this.local is not null) { this.local!.reset(); return; }
-    this.cli.send(this.kid!.handle, "reset\n".toBytes());
+    this.kid!.input().write("reset\n".toBytes());
   }
+
+  /** Wait `ms` milliseconds. */
+  async void sleep(this, i32 ms) { await this.clock.sleepMillis(ms); }
 
   /**
    * Check — or with `kind` "build", compile — `entry`; or with `kind` "query", ask what is at
    * `file\toffset`. One at a time: the caller waits for each.
    */
   async Outcome run(this, string kind, string entry) {
-    while (this.busy) { await this.core.sleepMillis(15).ticket(); }
+    while (this.busy) { await this.clock.sleepMillis(15); }
     this.busy = true;
     Outcome o = await this.exchange(kind, entry);
     this.busy = false;
@@ -279,7 +308,7 @@ export struct Checker {
     i32 id = this.nextId;
     this.nextId++;
     if (this.local is not null) { return await this.local!.run(kind, id, entry); }
-    await this.cli.send(this.kid!.handle, "\{kind}\t\{id}\t\{entry}\n".toBytes()).ticket();
+    await this.kid!.input().write("\{kind}\t\{id}\t\{entry}\n".toBytes());
     while (true) {
       string? head = this.in.line();
       if (head is not null) {
@@ -298,11 +327,5 @@ export struct Checker {
     }
   }
 
-  async bool more(this) {
-    match (await this.cli.recv(this.kid!.handle).ticket()) {
-      Data(b): { this.in.add(b); return true; }
-      End: { return false; }
-      Failed(why): { return false; }
-    }
-  }
+  async bool more(this) { return await fill(this.kid!.output(), this.in); }
 }

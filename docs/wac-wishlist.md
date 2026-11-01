@@ -3,13 +3,13 @@
 Kept as the IDE is built: each item says what it would enable, what the IDE does instead today, and
 where in wac it lives. Most important first. Measured against wac `25a34468`.
 
-**Items 1 and 4 now have an implementation**, on wac branch `ide-queries` (in `wac-patches/`), which the
-IDE is built against. They are written as proposals for wac: take them, change them, or say what should
-be different.
+**Items 1, 3, 4, 6 and 7 are in wac now** (2026-11-01): the IDE is built against wac master and `web` at
+git.voltrevo.com, and `wac-patches/` is gone. Item 4 went in as `factsAt`, which answers from the checker itself
+rather than from a second resolver over the syntax.
 
 ## For the editor
 
-### 1. The caret and the selection of a text field — *done on `ide-queries`*
+### 1. The caret and the selection of a text field — *done, in `web`*
 
 **Done as:** `ElementEvent.selStart` and `selEnd` on every event from an `<input>` or `<textarea>` (-1
 elsewhere); `Element.select(start, end)`, which like a rendered value does not land over typing the
@@ -44,7 +44,10 @@ change is drawn again. `Element.scrollIntoView` exists and is what jumping to a 
 
 **Where:** `packages/web` — the browser half reports a scroll event with `x` and `y` of 0.
 
-### 3. The compiler, and the `wac` command's gathering, in the root library
+### 3. The compiler, and the `wac` command's gathering, in the root library — *done*
+
+**Done as:** `wacc` and `wac` in wac's root entry (`import { wacc.factsAt, wac.gatherWith } from "wac"`), and
+`vendor/` is gone. What follows is what it was.
 
 **Wanted:** `wacc` (`packages/wacc/src/api.wac`) and `sources.wac` (`gatherWith`, `gatherNeeded`,
 `ReadCache`, `resOf`) reachable as `import { … } from "wac"`.
@@ -55,7 +58,11 @@ type.
 
 **Where:** `lib.wac` at the repository root.
 
-### 4. Answers to "what is at this position" — *done on `ide-queries`*
+### 4. Answers to "what is at this position" — *done, as `factsAt`*
+
+**Done as:** `wacc.factsAt(paths, sources, res, file, offset)`, a `PositionFacts`, which the checker answers from
+what it resolved while checking. The checker's process writes it as the lines `info.wac` reads. What follows is
+what the IDE's own proposal was.
 
 **Done as:** `queryIn(paths, sources, res, file, offset)` in `packages/wacc/src/api.wac`, answering the
 token's type, where it is declared, that line, and its doc comment. Definitions are found by reading
@@ -96,7 +103,7 @@ because a click moves the caret first.
 
 ### 4b. Faster answers about a position
 
-**Wanted:** `queryIn` without re-checking the file's whole closure — the checker's per-function work
+**Wanted:** `factsAt` without re-checking the file's whole closure — the checker's per-function work
 kept between queries, say, or a query that checks only the function holding the token.
 
 **Instead:** a query costs what checking the file does: about 0.2 s for a small file, 1–2 s in
@@ -104,7 +111,7 @@ kept between queries, say, or a query that checks only the function holding the 
 
 ## For running things
 
-### 6. A page runs a module it is given
+### 6. A page runs a module it is given — *done in wac, not used here yet*
 
 **Wanted:** design/system/0015 (proposed upstream).
 
@@ -112,7 +119,7 @@ kept between queries, say, or a query that checks only the function holding the 
 
 **Instead:** Build compiles the file in front and downloads the `.wasm`.
 
-### 7. Spawning from a page opened from a file — or at least an answer
+### 7. Spawning from a page opened from a file — or at least an answer — *done in wac, not used here yet*
 
 **Wanted:** on `file://`, `spawnSelf` either works (design/system/0015's second half) or answers with an
 error.

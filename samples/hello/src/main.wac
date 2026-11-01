@@ -4,6 +4,6 @@ import { double } from "./util.wac";
 
 export i32 main(Sys sys) {
   i32 n = double(21);
-  sys.core.log("the answer is \{n}");
+  sys.stdout().line("the answer is \{n}");
   return 0;
 }

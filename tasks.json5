@@ -5,6 +5,4 @@
   test: "wac test test",
   // In Chromium, against dist/ — build first; needs Playwright.
   "test:ide": "node tools/ide_test.js",
-  // Copy the compiler and the `wac` command's gathering from a wac checkout into vendor/wac/.
-  vendor: "python3 tools/vendor_wac.py",
 }
