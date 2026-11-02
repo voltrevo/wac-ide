@@ -5,7 +5,7 @@
   imports: {
     // wac's packages, as one dependency — `import { wacc.diagnoseGraphIn, gzip.inflateResult } from "wac"` — the
     // compiler and the `wac` command's gathering among them, which this project used to copy into vendor/.
-    wac: { git: 'https://github.com/voltrevo/wac.git', ref: '6f3ee40931c09aed8cdd66950cbb51b4954924b7' },
+    wac: { git: 'https://github.com/voltrevo/wac.git', ref: '84955c78c187a9c5f0c5be13d6666927c7fbdcef' },
     // The page a program is handed — `import { Page, Desktop } from "web"` — a repository of its own since 2026-10-29.
     web: { git: 'https://github.com/voltrevo/wac-web.git', ref: '129a3cd351e5f11897e5acfd6101682e7387e6fa' },
     // The page builder `build.wac` calls.
