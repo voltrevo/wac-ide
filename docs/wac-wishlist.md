@@ -191,3 +191,7 @@ package — wac-desktop pinning `web` at one commit and the IDE at another — w
 *local of an unspelled type* on `auto version = ui.state(0)`. **Instead:** a name `web` does not use (`Viewport`), and
 every repository a build reaches pinning the same `web`. A patched `emit.wac` that names each untyped lambda's file,
 line and column found it in a minute where bisecting the source had not.
+
+Functions too: `wac test` over a directory builds every test file into one module, and a private `keep` in two app
+files (Mandelbrot's and Pip's, each imported by its own test) gave a module the engine refused — though each file
+passed on its own. **Instead:** names no other file in the build uses.
