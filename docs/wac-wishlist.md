@@ -179,3 +179,15 @@ focuses its finder and its new-file box through a `Ref` instead.
 *"a call to `.redraw`, which this expression is emitted as and which is not in the program"* — the emitter treats it
 as a method call. **Instead:** `fn<void()> f = a.redraw; f();` (`redraw` in `src/ide.wac`).
 
+
+### 13. Two modules' types of one name are taken for each other
+
+**Seen** in wac-desktop's Mandelbrot, which declared `struct View` while importing `web`, whose `view.wac` has a
+`View` of its own. `wac check` was clean, but the build refused *a lambda (… 1 in a position the walk does not type
+yet …)* — the lambda `web`'s `Page.mountIn` hands to `View.create`, typed against the program's `View` — and a test
+importing the same file built a module the engine would not load (*reached end while decoding signature index*: the
+function section's count three more than its entries). The same happens when a build reaches two commits of one
+package — wac-desktop pinning `web` at one commit and the IDE at another — which refused the IDE's build with
+*local of an unspelled type* on `auto version = ui.state(0)`. **Instead:** a name `web` does not use (`Viewport`), and
+every repository a build reaches pinning the same `web`. A patched `emit.wac` that names each untyped lambda's file,
+line and column found it in a minute where bisecting the source had not.
