@@ -1,0 +1,67 @@
+// The IDE's own package cache, holding `web`, so a page program written in the IDE checks, builds and runs.
+//
+// **A page program imports `web`**, which a build finds in a package cache: `<WAC_HOME>/cache/git/<repo>/<commit>/`.
+// A page in a browser has no `$WAC_HOME`, nor any cache, so the IDE keeps one beside its projects — `.wac-home` in
+// the folder of projects, which the projects screen leaves out — and tells its checker so (`ReadCache.wacHome`). It
+// is an absolute path, as a cache must be: a relative one is read from the importing file's folder. What
+// is in it is the `web` the IDE is built with (`websrc.wac`), written there once. A page project the IDE makes pins
+// that commit, so it resolves there; a project pinning another commit of `web` is told it is not in the cache.
+
+import { Files } from "std";
+import { webCommit, webGit, webPaths, webTexts } from "./websrc.wac";
+
+/** Where the IDE's package cache is, for the folder of projects `home`. */
+export string wacHomeIn(string home) { return "\{home}/.wac-home"; }
+
+/** `url` as a folder's name, as wac's package cache spells it (wac's `packages/wacpkg/src/cache.wac`, `escapeRepo`). */
+export string escapeRepo(string url) {
+  u8[] b = url.toBytes();
+  string hex = "0123456789ABCDEF";
+  string out = "";
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 c = b[i] as i32;
+    bool plain = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+    if (plain) { out = out + string.fromCodepoint(c); continue; }
+    if (c >= 'A' && c <= 'Z') { out = out + "!\{string.fromCodepoint(c + 32)}"; continue; }
+    out = out + "%" + hex.slice(c / 16, c / 16 + 1) + hex.slice(c % 16, c % 16 + 1);
+  }
+  return out;
+}
+
+/** Where `web` is in the cache. */
+export string webCheckout(string home) { return "\{wacHomeIn(home)}/cache/git/\{escapeRepo(webGit())}/\{webCommit()}"; }
+
+/** `web` in the cache, unless it is there already — its `pack.pack` is the cache's mark of a complete checkout. */
+export async string fillWebCache(Files fs, string home) {
+  string dir = webCheckout(home);
+  if ((await fs.stat("\{dir}/pack.pack")).isOk()) { return ""; }
+  string[] paths = webPaths();
+  string[] texts = webTexts();
+  for (i32 i = 0; i < paths.len(); i++) {
+    string p = "\{dir}/\{paths[i]}";
+    i32 k = p.len() - 1;
+    while (k > 0 && p.slice(k, k + 1) != "/") { k--; }
+    await fs.mkdir(p.slice(0, k), true);
+    match (await fs.writeFile(p, texts[i].toBytes())) {
+      Ok(v): { }
+      Err(why): { return "\{p}: \{why}"; }
+    }
+  }
+  match (await fs.writeFile("\{dir}/pack.pack", "written by the wac IDE\n".toBytes())) {
+    Ok(v): { return ""; }
+    Err(why): { return "\{dir}/pack.pack: \{why}"; }
+  }
+}
+
+/** A page project's manifest and lock: `web`, at the commit the IDE's cache holds. */
+export string pageManifest() {
+  return "{\n  imports: {\n    // The page the program is handed — `import { Page, Ui } from \"web\"`.\n"
+       + "    web: { git: '\{webGit()}', ref: '\{webCommit()}' },\n  },\n}\n";
+}
+
+export string pageLock() {
+  return "{\n  \"imports\": {\n    \"web\": { \"git\": \"\{webGit()}\", \"ref\": \"\{webCommit()}\", \"commit\": \"\{webCommit()}\" }\n  }\n}\n";
+}
+
+/** Whether `text` is a page program's: its `main` takes the page. */
+export bool isPageProgram(string text) { return text.indexOf("main(Page ") >= 0; }

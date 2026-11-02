@@ -97,7 +97,11 @@ async bool isFolder(Files fs, string path) {
 export async string[] projects(Files fs, string home) {
   string[] names = await namesIn(fs, home);
   Vec<string> dirs = Vec.create();
-  for (i32 i = 0; i < names.len(); i++) { if (await isFolder(fs, join(home, names[i]))) { dirs.push(names[i]); } }
+  // A folder whose name starts with a dot is not a project: the IDE's package cache, `.wac-home`, is one.
+  for (i32 i = 0; i < names.len(); i++) {
+    if (names[i].len() > 0 && names[i].slice(0, 1) == ".") { continue; }
+    if (await isFolder(fs, join(home, names[i]))) { dirs.push(names[i]); }
+  }
   return sortedNames(dirs.toArray());
 }
 

@@ -148,6 +148,22 @@ const check = (ok, what, seen) => { if (!ok) failed++; console.log(`${ok ? 'ok  
   await p.locator('.proj').click(); await settle(400);
   check((await texts('.pcard .nm')).join() === 'hello', 'the projects screen lists it', await texts('.pcard .nm'));
 
+  // **A page program**: `web` from the IDE's own package cache, so it checks; Run draws it in the Page panel, and a
+  // click there reaches it.
+  await p.locator('.home .newpage').click();
+  await p.waitForSelector('.tab', { timeout: 30000 });
+  await checked();
+  check((await text('.status')) === 'No problems', 'a new page project checks, web found in the IDE\'s own cache', [await text('.status'), await texts('.prow')]);
+  await p.locator('.top .btn', { hasText: 'Run' }).click();
+  await p.waitForFunction(() => document.querySelector('.pagehost .count') !== null, null, { timeout: 90000 }).catch(() => {});
+  const pageShown = (await text('.pagehost')).includes('Clicks: 0');
+  if (!pageShown) { await p.locator('.phead .ptab', { hasText: 'Output' }).click().catch(() => {}); await settle(300); }
+  check(pageShown, 'Run shows a page program in the Page panel', [await text('.pagehost'), await text('.output'), await text('.toast')]);
+  await p.locator('.pagehost .up').click(); await settle(600);
+  check((await text('.pagehost .count')) === '1', 'and a click there reaches the program', await text('.pagehost'));
+  await shot('3-page');
+  await p.locator('.phead .btn', { hasText: 'Stop' }).click(); await settle(400);
+
   // From a file: no storage, and no worker of the page's own — so checking runs in the page.
   const q = await (await browser.newContext({ viewport: { width: 1400, height: 860 } })).newPage();
   q.on('pageerror', (e) => errors.push('file:// ' + e.message));

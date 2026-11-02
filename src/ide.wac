@@ -20,7 +20,9 @@ import { Info, parseInfo } from "./info.wac";
 import { Entry, Got, Incoming, Unpacked, PROJECTS, commonTop, ignored, join, leafOf, list, lowerOf, parentOf, projectName,
          projects, read, remove, rootOf, store, unpack, walk, write } from "./store.wac";
 import { css, icon } from "./style.wac";
-import { Running, Test, runnerSource, start as startRun, testsIn, trappedIn } from "./run.wac";
+import { Running, Test, runnerSource, start as startRun, startPage, testsIn, trappedIn } from "./run.wac";
+import { fillWebCache, isPageProgram, pageLock, pageManifest, wacHomeIn } from "./webcache.wac";
+import { moduleFor } from "webbuild";
 
 static string STATE = "ide/state";
 static i32 QUIET = 600;
@@ -101,12 +103,15 @@ struct App {
   string runEnd;
   /** A project whose card's own button was just clicked, which the card's click is not to open. */
   string opening;
+  /** On a page of its own, where a page program Run starts draws: the Page panel's element. */
+  Ref? pageHost;
+  bool pageRan;
 }
 
 App newApp(Shared s, Page page) {
   return App(s, page, () => { }, false, "", Map.create(hashString, stringEq), Map.create(hashString, stringEq), "",
              Vec.create(), -1, Diag[](), 0, "", "", false, false, true, 0, false, "", 0, string[](), false, 0, null, 0, 0, 0, "", "", "", "", "",
-             "problems", Running.none(), "", "", "");
+             "problems", Running.none(), "", "", "", null, false);
 }
 
 /**
@@ -218,6 +223,7 @@ async void start(App a) {
   Got st = await read(sh.fs, STATE);
   redraw(a);
   Checker c = await Checker.start(sh.sys, sh.fs, sh.persistent);
+  c.home(wacHomeIn(sh.home));
   sh.check = c;
   sh.checkerNote = c.note;
   if (st.ok) {
@@ -349,6 +355,37 @@ export i32 main(Sys sys) {
   return 0;
 }
 """;
+
+static string HELLO_PAGE = """
+// A page: Run shows it — in a window of its own on wac's desktop, in the Page panel here otherwise.
+import { ElementEvent, Node, Page, Ui, html.b, html.button, html.p } from "web";
+
+Node Counter(Ui ui) {
+  auto n = ui.state(0);
+  return <p>Clicks: <b class="count">{"\\{n.get()}"}</b> <button class="up" onclick={(ElementEvent e) => { n.update((i32 x) => x + 1); }}>+1</button></p>;
+}
+
+export async i32 main(Page page) {
+  page.title("Counter");
+  page.mount((Ui ui) => <Counter/>);
+  return 0;
+}
+""";
+
+/** A new project whose program is a page: `web` pinned at the commit the IDE's package cache holds. */
+async void newPageProject(App a, fn<void()> bump) {
+  string name = projectName("page", a.s.projects);
+  string root = rootOf(a.s.home, name);
+  await write(a.s.fs, join(root, "wac.json5"), pageManifest().toBytes());
+  await write(a.s.fs, join(root, "wac.lock"), pageLock().toBytes());
+  await write(a.s.fs, join(root, "main.wac"), HELLO_PAGE.toBytes());
+  await write(a.s.fs, "ide/\{name}.files", "main.wac\nwac.json5\nwac.lock\n".toBytes());
+  a.s.projects = await projects(a.s.fs, a.s.home);
+  everyone(a.s);
+  await openProject(a, name, bump);
+  await openFile(a, join(root, "main.wac"), bump);
+  wantCheck(a, bump);
+}
 
 async void newProject(App a, fn<void()> bump) {
   string name = projectName("hello", a.s.projects);
@@ -595,11 +632,12 @@ async u8[] built(Page page, App a, string entry, fn<void()> bump) {
 /** Show the output panel for a run of `what`, starting. */
 void starting(App a, string what, fn<void()> bump) {
   a.run.stop();
+  if (a.run.box is not null) { a.run.box!.remove(); }
   a.panel = "output";
   a.problems = true;
   a.runWhat = what;
   a.runEnd = "";
-  a.run = Running(null, "", false, 0 - 1);
+  a.run = Running(null, "", false, 0 - 1, null, null, false);
   bump();
 }
 
@@ -609,15 +647,66 @@ async void runIt(Page page, App a, fn<void()> bump) {
   if ((d is null) || !isWac(d!.path) || a.s.check is null) { return; }
   await flush(a, bump);
   string path = d!.path;
+  if (isPageProgram(d!.text)) { await runPage(page, a, path, bump); return; }
   starting(a, "Running \{leafOf(path)}", bump);
   u8[] wasm = await built(page, a, path, bump);
   if (wasm.len() == 0) { wantCheck(a, bump); bump(); return; }
   fn<void()> ended = () => {
-    a.runEnd = a.run.status < 0 ? "ended without a status: it trapped, or was stopped" : "exited with \{a.run.status}";
+    a.runEnd = a.run.stopped ? "stopped" : (a.run.status < 0 ? "ended without a status: it trapped" : "exited with \{a.run.status}");
     bump();
   };
   a.run = await startRun(a.s.sys, wasm, string[](), a.s.fs, rootOf(a.s.home, a.project), bump, ended);
   bump();
+}
+
+/**
+ * **Run a page program**: wrapped as the page builder wraps one (web's `moduleFor`, handed to the checker as a file's
+ * contents, never written), built, and started with a page to draw on — a window of its own on wac's desktop, which
+ * closing stops; the Page panel otherwise. What it writes goes to Output, as any run's does.
+ */
+async void runPage(Page page, App a, string path, fn<void()> bump) {
+  string leaf = leafOf(path);
+  starting(a, "Running \{leaf}, a page", bump);
+  string wrapper = join(parentOf(path), "__wac_ide_page__.wac");
+  a.s.check!.put(wrapper, moduleFor("./\{leaf}", "web", "", false).toBytes());
+  u8[] wasm = await built(page, a, wrapper, bump);
+  a.s.check!.forget(wrapper);
+  if (wasm.len() == 0) { wantCheck(a, bump); bump(); return; }
+  fn<void()> ended = () => {
+    a.runEnd = a.run.stopped ? "stopped" : (a.run.status < 0 ? "ended without a status: it trapped" : "exited with \{a.run.status}");
+    bump();
+  };
+  string cwd = rootOf(a.s.home, a.project);
+  if (a.s.desk is not null) {
+    match (await a.s.desk!.openWindow(leaf)) {
+      Ok(w): {
+        fn<void(string)> titled = (string t) => { w.title(t); };
+        a.run = await startPage(a.s.sys, wasm, a.s.fs, cwd, w, w.root(), titled, bump, ended);
+        Running r = a.run;
+        stopWhenClosed(w, r);
+        bump();
+        return;
+      }
+      Err(why): {
+        a.runEnd = "no window to show it in: \{why}";
+        bump();
+        return;
+      }
+    }
+  }
+  Ref? host = a.pageHost;
+  if (host is null || host!.element() is null) { a.runEnd = "nowhere to show it"; bump(); return; }
+  a.pageRan = true;
+  a.panel = "page";
+  fn<void(string)> titled = (string t) => { a.runWhat = "Running \{leaf}: \{t}"; bump(); };
+  a.run = await startPage(a.s.sys, wasm, a.s.fs, cwd, page, host!.element()!, titled, bump, ended);
+  bump();
+}
+
+/** A page program's window, closed: the program is stopped. */
+async void stopWhenClosed(Page window, Running r) {
+  await window.closed();
+  r.stop();
 }
 
 /**
@@ -846,11 +935,18 @@ Node panelHead(App a, fn<void()> bump) {
   return <div class="phead">
     <button class={a.panel == "problems" ? "ptab on" : "ptab"} onclick={(ElementEvent e) => { a.panel = "problems"; bump(); }}>Problems</button>
     <button class={a.panel == "output" ? "ptab on" : "ptab"} onclick={(ElementEvent e) => { a.panel = "output"; bump(); }}>Output</button>
+    {a.pageRan ? <button class={a.panel == "page" ? "ptab on" : "ptab"} onclick={(ElementEvent e) => { a.panel = "page"; bump(); }}>Page</button>
+               : Node.Text("")}
     <span class="spacer"></span>
-    {a.panel == "output" && !a.run.done
+    {a.panel != "problems" && !a.run.done
       ? <button class="btn ghost stop" title="Stop it" onclick={(ElementEvent e) => { a.run.stop(); bump(); }}>{icon("stop", "sm")}Stop</button>
       : Node.Text("")}
     <button class="btn ghost" title="Hide" onclick={(ElementEvent e) => { a.problems = false; bump(); }}>{icon("close", "sm")}</button></div>;
+}
+
+/** The Page panel's head; the page itself is the host under it, which this view never draws into. */
+Node pagePanel(App a, fn<void()> bump) {
+  return <div class="pagepanel">{panelHead(a, bump)}</div>;
 }
 
 /** What the last Run or Test said, as it came, and how it ended. */
@@ -886,7 +982,11 @@ Node statusPill(App a, fn<void()> bump) {
   return <button class="status bad" onclick={toggle}>{icon("alert", "sm")}{what}</button>;
 }
 
-Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
+/**
+ * The workbench. Its bottom holds the panel and, under it, where a page program draws on a page of its own — always
+ * there, hidden unless the Page panel shows, so what the program drew lives on while another panel is in front.
+ */
+Node workbench(Page page, App a, Ref nameRef, Ref pageRef, fn<void()> bump) {
   fn<void()> onEdit = () => {
     a.editSeq++;
     if (a.info is not null) { a.info = null; a.infoSeq++; }
@@ -957,7 +1057,11 @@ Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
         </div>
       </div>
     </div>
-    {a.problems ? (a.panel == "output" ? outputPanel(a, bump) : problemsPanel(a, bump)) : <div></div>}
+    <div class="bottom">
+      {a.problems ? (a.panel == "output" ? outputPanel(a, bump) : (a.panel == "page" ? pagePanel(a, bump) : problemsPanel(a, bump)))
+                  : <div></div>}
+      <div class={a.problems && a.panel == "page" ? "pagehost" : "pagehost hidden"} ref={pageRef}></div>
+    </div>
     <div class="bar">
       {a.caretAt != "" && (d is not null) ? <span>{a.caretAt}</span> : Node.Text("")}
       <span>{a.checkSummary}</span>
@@ -1003,6 +1107,7 @@ Node home(App a, fn<void()> bump) {
         <label class="btn">{icon("upload", "sm")}Choose a folder<"input" type="file" class="hidden" webkitdirectory=""/></label>
         <label class="btn">{icon("upload", "sm")}Choose an archive<input type="file" class="hidden pick" accept=".zip,.tar,.gz,.tgz,.zst"/></label>
         <button class="btn primary" onclick={(ElementEvent e) => { newProject(a, bump); }}>{icon("plus", "sm")}New project</button>
+        <button class="btn newpage" onclick={(ElementEvent e) => { newPageProject(a, bump); }}>{icon("plus", "sm")}New page project</button>
       </div>
       {a.importing != "" ? <div class="progress">{icon("spin", "sm spin")}{a.importing}</div> : Node.Text("")}
     </div>
@@ -1023,6 +1128,8 @@ Node Ide(Ui ui, Page page, App a) {
   // An element made after the page loaded is not focused by `autofocus`, so these are focused by hand.
   Ref findRef = ui.ref();
   Ref nameRef = ui.ref();
+  Ref pageRef = ui.ref();
+  a.pageHost = pageRef;
   ui.effect("\{a.finding}", () => {
     if (a.finding && findRef.element() is not null) { findRef.element()!.focus(); }
     return () => { };
@@ -1065,7 +1172,7 @@ Node Ide(Ui ui, Page page, App a) {
               }}>
     <style>{css()}</style>
     {!a.ready ? <div class="home"><div class="progress">{icon("spin", "sm spin")}Starting…</div></div>
-                  : (a.project == "" ? home(a, bump) : workbench(page, a, nameRef, bump))}
+                  : (a.project == "" ? home(a, bump) : workbench(page, a, nameRef, pageRef, bump))}
     {a.finding ? finder(a, findRef, bump) : Node.Text("")}
     {a.error != "" ? <div class="toast bad">{icon("alert", "sm")}<span>{a.error}</span></div>
                    : (a.note != "" ? <div class="toast">{icon("check", "sm")}<span>{a.note}</span></div> : Node.Text(""))}
@@ -1088,6 +1195,9 @@ async void begin(Page page, App a) {
   sh.persistent = (await page.sys.files().mkdir(sh.home, true)).isOk();
   sh.fs = sh.persistent ? page.sys.files() : MemoryStore.create(page.sys.clock()).asUser("root");
   if (!sh.persistent) { await sh.fs.mkdir(sh.home, true); }
+  // The `web` page programs import, in the IDE's own package cache (`webcache.wac`).
+  string unpacked = await fillWebCache(sh.fs, sh.home);
+  if (unpacked != "") { sh.checkerNote = "page programs cannot be built here: \{unpacked}"; }
   await start(a);
   a.ready = true;
   redraw(a);

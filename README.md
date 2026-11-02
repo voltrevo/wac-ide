@@ -18,6 +18,11 @@ checking your code as you type. Built for real projects, up to the wac repositor
 - **Run** builds the file in front and starts it, in its project's folder with the project's files, its output in
   the **Output** panel as it comes, Stop to end it. **Test** runs the file's `test…` functions — those taking
   nothing or `Sys` — as `wac test` does: each `ok` or `FAIL` with why, and the test a trap stopped in named.
+- **A page program runs too** — one whose `main` takes the `Page`: wrapped as the page builder wraps one, and drawn
+  in a window of its own on wac's desktop, titled as it titles itself, which closing stops; in the **Page** panel
+  otherwise. **New page project** makes one, a counter to start from. It imports `web`, which the IDE keeps in a
+  package cache of its own (`.wac-home` beside the projects): the `web` it is built with, so a page project it makes
+  pins that commit.
 - **Build** compiles the file in front to a module that describes itself, as `wac build` writes one, and downloads
   it — or, on wac's desktop, writes it beside its source, where opening it runs it.
 - **On wac's desktop, a project can have a window of its own**: the window button on a project's card. Every
@@ -66,7 +71,8 @@ Measured in headless Chromium (`tools/ide_scale.js`):
 | | |
 |---|---|
 | `src/ide.wac` | the windows: projects, the tree, tabs, problems and output, the finder, saving, checking, building; what they share; and `checker`, the export the checker's process runs |
-| `src/run.wac` | Run and Test: a program started for the IDE and its output; the runner written around a file's tests |
+| `src/run.wac` | Run and Test: a program started for the IDE and its output, a page program with a page to draw on; the runner written around a file's tests |
+| `src/webcache.wac`, `src/websrc.wac` | the IDE's own package cache, holding `web` for page programs; `web`'s sources, written by `tools/websrc.py` |
 | `src/checker.wac` | the checker: the compiler and the `wac` command's gathering, with every file kept between checks; the messages between it and the page; the same engine run in the page where there is no process |
 | `src/editor.wac` | the editor: a transparent textarea over the coloured text, in chunks of 50 lines; diagnostics on their lines |
 | `src/highlight.wac` | colours, from the compiler's lexer |

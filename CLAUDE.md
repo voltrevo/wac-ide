@@ -19,6 +19,9 @@ built from the wac commit. `wac update` cannot fetch from git.voltrevo.com; `too
 
     sh tools/fill-cache.sh && wac task build && wac task test && wac task test:ide
 
+- **When the `web` pin moves, run `python3 tools/websrc.py`** and commit `src/websrc.wac`: it is the `web` page
+  programs written in the IDE are built with, and it is committed because wac's desktop builds the IDE from git.
+
 - `test:ide` drives Chromium with Playwright against `dist/` — build first. It covers http and `file://`.
 - `tools/ide_scale.js` is the measurement against the wac repository (see its header); README's table
   came from it. Run it after anything that touches the editor or the checker.

@@ -15,6 +15,7 @@
 //     page → checker   put\t<path>\t<n>\n<n bytes>     a file's contents now, saved or not
 //                      forget\t<path>\n                a file is gone, or should be read again
 //                      reset\n                         forget everything (a manifest changed)
+//                      home\t<path>\n                  the package cache is at <path> (`webcache.wac`)
 //                      check\t<id>\t<entry>\n          check what <entry> reaches
 //                      build\t<id>\t<entry>\n          compile <entry> to a module
 //                      query\t<id>\t<file>\t<offset>\n  what the name at byte <offset> of <file> is
@@ -31,7 +32,7 @@
 import { Map, Ticket, Vec, hashString, stringEq } from "core";
 import { Authority, Child, Clock, Env, Files, Input, Launch, Output, Sys } from "std";
 import { wac.ReadCache, wac.Sources, wac.exactly, wac.gatherNeeded, wac.gatherWith, wac.resOf } from "wac";
-import { wacc.PositionFacts, wacc.blockedFilesIn, wacc.diagnoseGraphIn, wacc.emitFilesSelfDescribingIn, wacc.factsAt } from "wac";
+import { wacc.PositionFacts, wacc.ProgramBuilt, wacc.buildProgramIn, wacc.diagnoseGraphIn, wacc.factsAt } from "wac";
 
 /**
  * What a module the IDE builds asks to be handed: read (1), write (2) and run (16) — what Run hands it, the project's
@@ -77,13 +78,26 @@ export string factsLines(PositionFacts f) {
   return out;
 }
 
+/**
+ * A fresh read cache, its packages in `wacHome` — the IDE's own package cache (`webcache.wac`), since a page has no
+ * `$WAC_HOME`, and the IDE keeps `web` there for the page programs written in it. `""` until the page says where.
+ */
+ReadCache cacheIn(string wacHome) {
+  ReadCache c = ReadCache.create();
+  c.wacHome = wacHome;
+  return c;
+}
+
 export struct Engine {
   Files fs;
   Env env;
   Clock clock;
   ReadCache cache;
 
-  Engine create(Files fs, Env env, Clock clock) { return Engine(fs, env, clock, ReadCache.create()); }
+  Engine create(Files fs, Env env, Clock clock) { return Engine(fs, env, clock, cacheIn("")); }
+
+  /** Packages from the cache at `wacHome`, from now on. */
+  void home(this, string wacHome) { this.cache = cacheIn(wacHome); }
 
   void put(this, string path, u8[] bytes) {
     this.cache.files.set(path, bytes);
@@ -97,7 +111,7 @@ export struct Engine {
     this.cache.specs.remove(path);
   }
 
-  void reset(this) { this.cache = ReadCache.create(); }
+  void reset(this) { this.cache = cacheIn(this.cache.wacHome); }
 
   async Outcome run(this, string kind, i32 id, string entry) {
     // A query is `file\toffset`, asked of the program that file is the entry of.
@@ -125,18 +139,15 @@ export struct Engine {
       string wire = diagnoseGraphIn(paths, texts, resOf(s), entry);
       return Outcome("check", id, s.n, (await now(this.clock) - t0) as! i32, wire.toBytes());
     }
-    // **A module that describes itself**, as `wac build` writes one: a page's host starts nothing else, and on wac's
-    // desktop the module Build writes runs when it is opened.
-    u8[] wasm = emitFilesSelfDescribingIn(paths, texts, resOf(s), entry, wasmNameOf(entry), BUILT_GRANTS);
+    // **Built as `wac build` builds a program** (wacc's `buildProgramIn`): `main` adapted where a host cannot call it as
+    // written, what the entry does not reach left out, and the module describing itself — a page's host starts nothing
+    // else, and on wac's desktop the module Build writes runs when it is opened.
+    ProgramBuilt b = buildProgramIn(paths, texts, resOf(s), entry, wasmNameOf(entry), BUILT_GRANTS);
     i32 total = (await now(this.clock) - t0) as! i32;
-    if (wasm.len() == 0) {
-      string why = blockedFilesIn(paths, texts, resOf(s), entry);
-      if (why == "") {
-        why = diagnoseGraphIn(paths, texts, resOf(s), entry) != "" ? "it has errors — see Problems" : "the compiler made nothing";
-      }
-      return Outcome("error", id, s.n, total, why.toBytes());
+    if (b.why != "") {
+      return Outcome("error", id, s.n, total, (b.why == "it has errors" ? "it has errors — see Problems" : b.why).toBytes());
     }
-    return Outcome("wasm", id, s.n, total, wasm);
+    return Outcome("wasm", id, s.n, total, b.wasm);
   }
 }
 
@@ -251,6 +262,8 @@ export async i32 serve(Sys sys) {
       e.forget(f[1]);
     } else if (f[0] == "reset") {
       e.reset();
+    } else if (f[0] == "home" && f.len() >= 2) {
+      e.home(f[1]);
     } else if ((f[0] == "check" || f[0] == "build") && f.len() >= 3) {
       await out.write(framed(await e.run(f[0], num(f[1]), f[2])));
     } else if (f[0] == "query" && f.len() >= 4) {
@@ -298,6 +311,12 @@ export struct Checker {
   void forget(this, string path) {
     if (this.local is not null) { this.local!.forget(path); return; }
     this.kid!.input().write("forget\t\{path}\n".toBytes());
+  }
+
+  /** Packages from the cache at `wacHome` (`webcache.wac`). */
+  void home(this, string wacHome) {
+    if (this.local is not null) { this.local!.home(wacHome); return; }
+    this.kid!.input().write("home\t\{wacHome}\n".toBytes());
   }
 
   void reset(this) {

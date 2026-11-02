@@ -11,6 +11,7 @@
 
 import { Ticket, Vec } from "core";
 import { Authority, Child, Files, Input, Launch, Sys } from "std";
+import { Element, Page, PageServer } from "web";
 
 /** One `test…` function a file exports, as the runner calls it. */
 export struct Test {
@@ -133,11 +134,22 @@ export struct Running {
   bool done;
   /** Its status once `done`; -1 when it ended without one — a trap, or stopped. */
   i32 status;
+  /** A page program's page, served into an element of the IDE's: the server, and the element made for this run. */
+  PageServer? server;
+  Element? box;
+  /** It was stopped — Stop, or its window closed — rather than ending by itself. */
+  bool stopped;
 
-  Running none() { return Running(null, "", true, 0); }
+  Running none() { return Running(null, "", true, 0, null, null, false); }
 
-  /** Stop it, if it is still going. */
-  void stop(this) { if (!this.done && this.child is not null) { this.child!.stop(); } }
+  /** Stop it, if it is still going; its page, if it has one, hears it is closed. */
+  void stop(this) {
+    if (!this.done && this.child is not null) {
+      this.stopped = true;
+      this.child!.stop();
+    }
+    if (this.server is not null) { this.server!.close(); }
+  }
 }
 
 /** Everything `input` says, into `r`'s output as it arrives; `heard` after each piece. */
@@ -163,7 +175,7 @@ async void drain(Input input, Running r, fn<void()> heard) {
  * arrives, `heard` after each piece, and `ended` once it has ended and said everything.
  */
 export async Running start(Sys sys, u8[] wasm, string[] args, Files files, string cwd, fn<void()> heard, fn<void()> ended) {
-  Running r = Running(null, "", false, 0 - 1);
+  Running r = Running(null, "", false, 0 - 1, null, null, false);
   match (await sys.procs().spawn(wasm, args, Authority(files, null, null, null), Launch(cwd, false, false, false))) {
     Ok(child): {
       r.child = child;
@@ -190,3 +202,35 @@ async void watch(Child child, Running r, fn<void()> heard, fn<void()> ended) {
   r.done = true;
   ended();
 }
+
+/**
+ * **A page program, started with a page to draw on**: `wasm` is the module `pageModule` makes of it, and its `wac.page`
+ * is answered by a `PageServer` drawing into a new element made in `into` — a window of the IDE's on wac's desktop,
+ * or the Page panel of an IDE on its own. Its title goes to `onTitle`; what it writes and logs, into the output.
+ */
+export async Running startPage(Sys sys, u8[] wasm, Files files, string cwd, Page page, Element into,
+                               fn<void(string)> onTitle, fn<void()> heard, fn<void()> ended) {
+  Element box = into.append("div");
+  box.attr("class", "pagebox");
+  Running r = Running(null, "", false, 0 - 1, null, box, false);
+  fn<void(string)> logged = (string line) => {
+    r.output = r.output + line + "\n";
+    heard();
+  };
+  PageServer server = PageServer.into(page, box, onTitle, logged);
+  r.server = server;
+  match (await sys.procs().spawnProviding(wasm, string[](), Authority(files, null, null, null), [server.provider()],
+                                          Launch(cwd, false, false, false))) {
+    Ok(child): {
+      r.child = child;
+      watch(child, r, heard, ended);
+    }
+    Err(why): {
+      r.output = "could not start: \{why}\n";
+      r.done = true;
+      ended();
+    }
+  }
+  return r;
+}
+
