@@ -35,27 +35,26 @@ string icons() {
 
 export string css() {
   return """
-    /* `:host` too: on wac's desktop the IDE's window is a shadow root, where `:root` matches nothing. */
+    /* Every colour is `light-dark()`, chosen by the `color-scheme` of whatever uses it. A page on its own follows the
+       system; on wac's desktop the IDE's window is a shadow root, where `:root` matches nothing — the tokens are
+       declared on `:host` too, and the scheme is inherited from the desktop, which may be set light or dark. */
     :root, :host {
-      --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --edit: #ffffff; --line: #e3e6ec; --line-2: #d3d7e0;
-      --text: #1b2130; --muted: #5f687b; --faint: #98a0b0; --hover: #eceef3; --sel: #e7e6fd;
-      --accent: #5b55e6; --accent-2: #8b5cf6; --accent-soft: #ecebfd;
-      --err: #d63c3c; --err-soft: #fdecec; --warn: #b7791f; --warn-soft: #fdf3e2; --ok: #16a34a;
-      --hk: #8b3fd9; --hs: #0f7b4a; --hn: #c2410c; --hl: #c2410c; --hc: #8a93a3; --ht: #0e7490; --hy: #2457c5;
-      --caret: #1b2130; --selection: rgb(91 85 230 / .22);
-      color-scheme: light;
+      --bg: light-dark(#f6f7f9, #0d0f14); --panel: light-dark(#ffffff, #12151c);
+      --panel-2: light-dark(#f1f3f6, #161a22); --edit: light-dark(#ffffff, #0f1218);
+      --line: light-dark(#e3e6ec, #222733); --line-2: light-dark(#d3d7e0, #2d3341);
+      --text: light-dark(#1b2130, #e4e7ee); --muted: light-dark(#5f687b, #959cad);
+      --faint: light-dark(#98a0b0, #646b7c); --hover: light-dark(#eceef3, #1b1f29); --sel: light-dark(#e7e6fd, #23224a);
+      --accent: light-dark(#5b55e6, #8d88ff); --accent-2: light-dark(#8b5cf6, #b28bff);
+      --accent-soft: light-dark(#ecebfd, #24224a);
+      --err: light-dark(#d63c3c, #f47067); --err-soft: light-dark(#fdecec, #3a1d1f);
+      --warn: light-dark(#b7791f, #e3b341); --warn-soft: light-dark(#fdf3e2, #33290f);
+      --ok: light-dark(#16a34a, #4ade80);
+      --hk: light-dark(#8b3fd9, #c792ea); --hs: light-dark(#0f7b4a, #a5d6a7); --hn: light-dark(#c2410c, #f7a76c);
+      --hl: light-dark(#c2410c, #f7a76c); --hc: light-dark(#8a93a3, #6b7385); --ht: light-dark(#0e7490, #7fdbca);
+      --hy: light-dark(#2457c5, #82aaff);
+      --caret: light-dark(#1b2130, #e4e7ee); --selection: light-dark(rgb(91 85 230 / .22), rgb(141 136 255 / .28));
     }
-    @media (prefers-color-scheme: dark) {
-      :root, :host {
-        --bg: #0d0f14; --panel: #12151c; --panel-2: #161a22; --edit: #0f1218; --line: #222733; --line-2: #2d3341;
-        --text: #e4e7ee; --muted: #959cad; --faint: #646b7c; --hover: #1b1f29; --sel: #23224a;
-        --accent: #8d88ff; --accent-2: #b28bff; --accent-soft: #24224a;
-        --err: #f47067; --err-soft: #3a1d1f; --warn: #e3b341; --warn-soft: #33290f; --ok: #4ade80;
-        --hk: #c792ea; --hs: #a5d6a7; --hn: #f7a76c; --hl: #f7a76c; --hc: #6b7385; --ht: #7fdbca; --hy: #82aaff;
-        --caret: #e4e7ee; --selection: rgb(141 136 255 / .28);
-        color-scheme: dark;
-      }
-    }
+    :root { color-scheme: light dark; }
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; }
     body { background: var(--bg); color: var(--text); overflow: hidden;
