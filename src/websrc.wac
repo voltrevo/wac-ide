@@ -1,9 +1,9 @@
-// Written by tools/websrc.py from web 2fd6f4160: the `web` package the IDE is built with, for the page programs
+// Written by tools/websrc.py from web c2e454af3: the `web` package the IDE is built with, for the page programs
 // written in it (`webcache.wac`). Do not edit; run the script when the pin moves.
 
 /** The repository `web` is fetched from, and the commit these are. */
 export string webGit() { return "https://github.com/voltrevo/wac-web.git"; }
-export string webCommit() { return "2fd6f4160af3cf76d692845ea6e7a919135faf49"; }
+export string webCommit() { return "c2e454af384b2901eefef7b9ff9f85d83bb8aae8"; }
 
 /** Each file's path in the package, and its text. */
 export string[] webPaths() { return ["wac.json5", "src/desktop.wac", "src/element.wac", "src/html.wac", "src/line.wac", "src/page.wac", "src/serve.wac", "src/site.wac", "src/tags.wac", "src/testdoc.wac", "src/view.wac"]; }
