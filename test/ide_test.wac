@@ -7,6 +7,8 @@ import { Inbox, Outcome, framed, num, putMessage, tabbed } from "../src/checker.
 import { Doc, byteOf, dirty, lineAt, newDoc, newlineAt, offsetOf, retext, u16Of } from "../src/editor.wac";
 import { Info, parseInfo } from "../src/info.wac";
 import { score } from "../src/ide.wac";
+import { Test, runnerSource, testsIn, trappedIn } from "../src/run.wac";
+import { wacc.Res, wacc.diagnoseGraphIn } from "wac";
 
 export string test_diagnostics_read_from_the_wire() {
   string wire = "projects/p/a.wac\t3\t7\tcheck\tunknown name\t`x` is not declared\tdeclare it\t1\n"
@@ -135,5 +137,48 @@ export string test_enter_keeps_the_indent_and_adds_one_after_an_opener() {
   if (newlineAt("  if (x) {", 10) != "\n    ") { return "adds after {"; }
   if (newlineAt("f(", 2) != "\n  ") { return "adds after ("; }
   if (newlineAt("a\n    b", 7) != "\n    ") { return "the line the caret is on"; }
+  return "";
+}
+
+// ── Run and Test ────────────────────────────────────────────────────────────
+
+static string SAMPLE_TESTS = """
+import { Sys } from "std";
+
+export string test_adds() { i32 two = 1 + 1; return two == 2 ? "" : "arithmetic"; }
+export string test_reads(Sys sys) { return ""; }
+export async string test_later() { return ""; }
+export void test_traps() { }
+export string test_odd(i32 n) { return ""; }
+export string helper() { return ""; }
+string test_hidden() { return ""; }
+""";
+
+export string test_a_files_tests_are_found_as_written() {
+  Test[] ts = testsIn(SAMPLE_TESTS);
+  string got = "";
+  for (i32 i = 0; i < ts.len(); i++) {
+    got = got + ts[i].name + (ts[i].takesSys ? " sys" : "") + (ts[i].isAsync ? " async" : "") + (ts[i].isVoid ? " void" : "")
+        + (ts[i].skip != "" ? " skipped" : "") + ";";
+  }
+  if (got != "test_adds;test_reads sys;test_later async;test_traps void;test_odd skipped;") { return got; }
+  return "";
+}
+
+/** The runner the IDE writes checks clean against the file it runs: what the compiler is handed is a program. */
+export string test_the_runner_is_a_program_that_calls_each_test() {
+  string runner = runnerSource("x_test.wac", testsIn(SAMPLE_TESTS));
+  string wire = diagnoseGraphIn(["/t/x_test.wac", "/t/run.wac"], [SAMPLE_TESTS, runner], Res.empty(), "/t/run.wac");
+  if (wire != "") { return "the runner does not check: " + wire + "\n" + runner; }
+  if (runner.indexOf("failed += said(sys, \"test_reads\", test_reads(sys));") < 0) { return "test_reads is not handed sys"; }
+  if (runner.indexOf("await test_later()") < 0) { return "an async test is not awaited"; }
+  if (runner.indexOf("skip test_odd") < 0) { return "test_odd is not said to be skipped"; }
+  return "";
+}
+
+export string test_a_runner_that_stopped_short_names_the_test_it_was_in() {
+  Test[] ts = testsIn(SAMPLE_TESTS);
+  if (trappedIn(ts, "ok   test_adds\nok   test_reads\n") != "test_later") { return "after two"; }
+  if (trappedIn(ts, "ok   test_adds\nFAIL test_reads — no\nok   test_later\nok   test_traps\n") != "") { return "all reported"; }
   return "";
 }

@@ -1,0 +1,6 @@
+// Tests for util.wac: one that holds, and one wrong on purpose, so the IDE's Test has both to show.
+import { double } from "./util.wac";
+
+export string test_doubles() { return double(21) == 42 ? "" : "double(21) is \{double(21)}"; }
+
+export string test_wrong_on_purpose() { return double(2) == 5 ? "" : "double(2) is \{double(2)}, not 5"; }

@@ -83,6 +83,26 @@ const check = (ok, what, seen) => { if (!ok) failed++; console.log(`${ok ? 'ok  
   await settle(300);
   check((await text('.toast')).includes('Built main.wasm'), 'and says so', await text('.toast'));
 
+  // Run: the file in front built and started in its project's folder, what it says in the Output panel.
+  // Until the run that starts with `what` has ended — its last line, `— how it ended`.
+  const ran = async (what) => {
+    await p.waitForFunction((what) => { const t = document.querySelector('.output')?.textContent ?? ''; return t.startsWith(what) && t.includes('— '); }, what, { timeout: 90000 }).catch(() => {});
+    return text('.output');
+  };
+  await p.locator('.top .btn', { hasText: 'Run' }).click();
+  let out = await ran('Running main.wac');
+  check(out.includes('the answer is 42') && out.includes('exited with 0'), 'Run builds the file and shows what it says', out);
+  // Test: the file's test functions, each said to pass or fail, the one that fails with why.
+  await p.locator('.tnode', { hasText: 'util_test.wac' }).click();
+  await checked();
+  await p.locator('.top .btn', { hasText: 'Test' }).click();
+  out = await ran('Testing util_test.wac');
+  check(out.includes('ok   test_doubles') && out.includes('FAIL test_wrong_on_purpose — double(2) is 4, not 5')
+        && out.includes('1 passed, 1 failed') && out.includes('some tests failed'), 'Test runs each test and says how it went', out);
+  await shot('1b-tested');
+  await p.locator('.tab.on .x').click(); await settle(300);
+  await p.locator('.phead .ptab', { hasText: 'Problems' }).click(); await settle(200);
+
   // What a name is, and where it is declared: from the caret, with F12, and with Ctrl+click.
   await p.locator('.tab', { hasText: 'main.wac' }).click(); await settle(300);
   const mainText = await editor().inputValue();

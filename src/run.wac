@@ -1,0 +1,192 @@
+// Run and Test: a program the IDE built, run as a process of the IDE's own, its output shown as it comes.
+//
+// **Run** builds the file in front (as Build does) and starts the module — `Procs.spawn`, handed the IDE's files and
+// working in its project's folder — so `main(Sys sys)` reads and writes the project as `wac run` would from there.
+//
+// **Test** is `wac test` for the file in front, without loading a module into the IDE: the IDE writes a small
+// program around the file's `test…` functions (`runnerSource`), which calls each and says how it went, `ok` or
+// `FAIL` and why, as `wac test` does; the checker builds it, and it runs like any other. The runner is never written
+// to the disk — the checker is handed it as a file's contents, as it is handed every unsaved edit. A test that traps
+// ends the runner where it is, and the IDE names it: the first the runner had not reported.
+
+import { Ticket, Vec } from "core";
+import { Authority, Child, Files, Input, Launch, Sys } from "std";
+
+/** One `test…` function a file exports, as the runner calls it. */
+export struct Test {
+  string name;
+  /** It takes `Sys sys`, which the runner hands it. */
+  bool takesSys;
+  bool isAsync;
+  bool isVoid;
+  /** Why the runner leaves it out, or `""`: a parameter other than `Sys`. */
+  string skip;
+}
+
+string trimmed(string s) {
+  i32 a = 0;
+  i32 b = s.len();
+  while (a < b && (s.slice(a, a + 1) == " " || s.slice(a, a + 1) == "\t")) { a++; }
+  while (b > a && (s.slice(b - 1, b) == " " || s.slice(b - 1, b) == "\t" || s.slice(b - 1, b) == "\r")) { b--; }
+  return s.slice(a, b);
+}
+
+/** `s` without `prefix` at its start, or `""` when it does not start so. */
+string after(string s, string prefix) {
+  return s.len() >= prefix.len() && s.slice(0, prefix.len()) == prefix ? s.slice(prefix.len(), s.len()) : "";
+}
+
+/**
+ * The `test…` functions `text` exports, in order: each line that starts `export`, then perhaps `async`, then `string`
+ * or `void`, a name beginning `test`, and its parameters. Written so by every wac test file; one written otherwise
+ * is not found, and the file's other tests still are.
+ */
+export Test[] testsIn(string text) {
+  Vec<Test> out = Vec.create();
+  i32 start = 0;
+  for (i32 i = 0; i <= text.len(); i++) {
+    if (i < text.len() && text.slice(i, i + 1) != "\n") { continue; }
+    string line = text.slice(start, i);
+    start = i + 1;
+    string rest = after(line, "export ");
+    if (rest == "") { continue; }
+    bool isAsync = after(rest, "async ") != "";
+    if (isAsync) { rest = after(rest, "async "); }
+    bool isVoid = after(rest, "void ") != "";
+    if (!isVoid && after(rest, "string ") == "") { continue; }
+    rest = isVoid ? after(rest, "void ") : after(rest, "string ");
+    i32 open = rest.indexOf("(");
+    if (open <= 0) { continue; }
+    string name = rest.slice(0, open);
+    if (name.len() < 4 || name.slice(0, 4) != "test" || name.indexOf("<") >= 0 || name.indexOf(" ") >= 0) { continue; }
+    i32 close = rest.indexOf(")");
+    if (close < open) { continue; }
+    string params = trimmed(rest.slice(open + 1, close));
+    bool takesSys = params != "" && after(params, "Sys ") != "" && params.indexOf(",") < 0;
+    string skip = params == "" || takesSys ? "" : "takes \{params}, and the IDE hands a test only `Sys`";
+    out.push(Test(name, takesSys, isAsync, isVoid, skip));
+  }
+  return out.toArray();
+}
+
+/** What the runner writes for a test that failed: `FAIL <name> — <why>`, its lines joined, as `wac test` says it. */
+export string runnerSource(string leaf, Test[] tests) {
+  string names = "";
+  string calls = "";
+  i32 n = 0;
+  for (i32 i = 0; i < tests.len(); i++) {
+    Test t = tests[i];
+    if (t.skip != "") {
+      calls = calls + "  sys.stdout().line(\"skip \{t.name} — \{t.skip}\");\n";
+      continue;
+    }
+    names = names + (n > 0 ? ", " : "") + t.name;
+    n++;
+    string call = (t.isAsync ? "await " : "") + t.name + (t.takesSys ? "(sys)" : "()");
+    calls = calls + (t.isVoid ? "  \{call};\n  failed += said(sys, \"\{t.name}\", \"\");\n"
+                              : "  failed += said(sys, \"\{t.name}\", \{call});\n");
+  }
+  return "// Written by the wac IDE to run \{leaf}'s tests: each in turn, saying how it went, as `wac test` does.\n"
+       + "import { Sys } from \"std\";\n"
+       + (n > 0 ? "import { \{names} } from \"./\{leaf}\";\n" : "")
+       + "\n"
+       + "i32 said(Sys sys, string name, string why) {\n"
+       + "  if (why == \"\") { sys.stdout().line(\"ok   \" + name); return 0; }\n"
+       + "  sys.stdout().line(\"FAIL \" + name + \" — \" + oneLine(why));\n"
+       + "  return 1;\n"
+       + "}\n\n"
+       + "string oneLine(string s) {\n"
+       + "  string out = \"\";\n"
+       + "  i32 start = 0;\n"
+       + "  for (i32 i = 0; i <= s.len(); i++) {\n"
+       + "    if (i < s.len() && s.slice(i, i + 1) != \"\\n\") { continue; }\n"
+       + "    out = out + (start > 0 ? \" / \" : \"\") + s.slice(start, i);\n"
+       + "    start = i + 1;\n"
+       + "  }\n"
+       + "  return out;\n"
+       + "}\n\n"
+       + "export async i32 main(Sys sys) {\n"
+       + "  i32 failed = 0;\n"
+       + calls
+       + "  sys.stdout().line(\"\\{\{n} - failed} passed, \\{failed} failed\");\n"
+       + "  return failed > 0 ? 1 : 0;\n"
+       + "}\n";
+}
+
+/**
+ * Which test a runner that stopped short was in: the first of `tests` it ran that `output` does not report. `""` when
+ * it reported them all.
+ */
+export string trappedIn(Test[] tests, string output) {
+  for (i32 i = 0; i < tests.len(); i++) {
+    if (tests[i].skip != "") { continue; }
+    string name = tests[i].name;
+    if (output.indexOf("ok   \{name}\n") < 0 && output.indexOf("FAIL \{name} — ") < 0) { return name; }
+  }
+  return "";
+}
+
+/** A program running for the IDE: what it has said, whether it is still going, and how it ended. */
+export struct Running {
+  Child? child;
+  string output;
+  bool done;
+  /** Its status once `done`; -1 when it ended without one — a trap, or stopped. */
+  i32 status;
+
+  Running none() { return Running(null, "", true, 0); }
+
+  /** Stop it, if it is still going. */
+  void stop(this) { if (!this.done && this.child is not null) { this.child!.stop(); } }
+}
+
+/** Everything `input` says, into `r`'s output as it arrives; `heard` after each piece. */
+async void drain(Input input, Running r, fn<void()> heard) {
+  while (true) {
+    match (await input.chunk()) {
+      Ok(piece): {
+        match (piece) {
+          Data(b): {
+            r.output = r.output + string.fromBytes(b);
+            heard();
+          }
+          default: { return; }
+        }
+      }
+      Err(why): { return; }
+    }
+  }
+}
+
+/**
+ * Start `wasm` with `args`, handed `files` and working in `cwd`: what it says goes into the answer's output as it
+ * arrives, `heard` after each piece, and `ended` once it has ended and said everything.
+ */
+export async Running start(Sys sys, u8[] wasm, string[] args, Files files, string cwd, fn<void()> heard, fn<void()> ended) {
+  Running r = Running(null, "", false, 0 - 1);
+  match (await sys.procs().spawn(wasm, args, Authority(files, null, null, null), Launch(cwd, false, false, false))) {
+    Ok(child): {
+      r.child = child;
+      watch(child, r, heard, ended);
+    }
+    Err(why): {
+      r.output = "could not start: \{why}\n";
+      r.done = true;
+      ended();
+    }
+  }
+  return r;
+}
+
+async void watch(Child child, Running r, fn<void()> heard, fn<void()> ended) {
+  Ticket<void> out = drain(child.output(), r, heard);
+  Ticket<void> err = drain(child.errors(), r, heard);
+  match (await child.exit()) {
+    Ok(code): { r.status = code; }
+    Err(why): { r.status = 0 - 1; }
+  }
+  await out;
+  await err;
+  r.done = true;
+  ended();
+}

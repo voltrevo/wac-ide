@@ -111,7 +111,7 @@ kept between queries, say, or a query that checks only the function holding the 
 
 ## For running things
 
-### 6. A page runs a module it is given — *done in wac, not used here yet*
+### 6. A page runs a module it is given — *done, and used: Run and Test*
 
 **Wanted:** design/system/0015 (proposed upstream).
 
@@ -172,3 +172,10 @@ of `web`'s named tags, and a block string that did not start on a new line.)
 
 That is the browser's rule, not wac's, but `web`'s named tags offer `autofocus` as if it worked. The IDE
 focuses its finder and its new-file box through a `Ref` instead.
+
+### 12. A function held in a field, called through the field, is not emitted
+
+**Seen:** `a.redraw()`, where `redraw` is a `fn<void()>` field of `App`, checks clean and then refuses the build:
+*"a call to `.redraw`, which this expression is emitted as and which is not in the program"* — the emitter treats it
+as a method call. **Instead:** `fn<void()> f = a.redraw; f();` (`redraw` in `src/ide.wac`).
+

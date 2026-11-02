@@ -1,8 +1,10 @@
 // wac IDE: projects in the browser's storage, an editor coloured by wac's own lexer, and wac's own
 // compiler checking as you type, in a process of its own.
 //
-// **The page** is the projects screen and the workbench: a file tree, tabs, the editor, the problems the
-// last check found, and a finder (Ctrl+P). **The checker** (`checker.wac`) is a copy of this page started
+// **A window** is the projects screen or one project's workbench: a file tree, tabs, the editor, the problems the
+// last check found, and a finder (Ctrl+P). **On wac's desktop each project can have a window of its own**
+// (`Desktop.openWindow`), all of them one program: one checker, warm for all of them, one owner of every file, and
+// one record of what was open. On a page of its own there is the one window, which moves between projects. **The checker** (`checker.wac`) is a copy of this page started
 // with `--spawn checker`; it keeps the compiler warm and every file it has read, and each edit is sent to
 // it as it is made, so a check sees what is on screen, saved or not. Edits are saved a moment after
 // typing stops, as they are sent.
@@ -10,14 +12,15 @@
 import { Map, Ticket, Vec, hashString, stringEq } from "core";
 import { Files, MemoryStore, Sys } from "std";
 import { Desktop, ElementEvent, MOD_CTRL, MOD_META, Node, Page, Picked, Ref, Ui, html.b, html.button, html.div, html.h1, html.input,
-         html.label, html.p, html.span, html.style } from "web";
-import { Checker, Outcome, serve } from "./checker.wac";
+         html.label, html.p, html.pre, html.span, html.style } from "web";
+import { Checker, Outcome, serve, tabbed } from "./checker.wac";
 import { Diag, errorCount, inFile, parseWire } from "./diag.wac";
 import { Doc, Editor, dirty, lineAt, newDoc, offsetOf, retext, u16Of } from "./editor.wac";
 import { Info, parseInfo } from "./info.wac";
 import { Entry, Got, Incoming, Unpacked, PROJECTS, commonTop, ignored, join, leafOf, list, lowerOf, parentOf, projectName,
          projects, read, remove, rootOf, store, unpack, walk, write } from "./store.wac";
 import { css, icon } from "./style.wac";
+import { Running, Test, runnerSource, start as startRun, testsIn, trappedIn } from "./run.wac";
 
 static string STATE = "ide/state";
 static i32 QUIET = 600;
@@ -26,19 +29,35 @@ static i32 SETTLE = 350;
 /** The checker's process: what `--spawn checker` runs. */
 export async i32 checker(Sys sys) { return await serve(sys); }
 
-// ── what the page holds ─────────────────────────────────────────────────────
+// ── what the program holds, and each window ─────────────────────────────────
 
-struct App {
+/** What every window shares: the disk, the checker, the projects, and the windows themselves. */
+struct Shared {
+  Sys sys;
   Files fs;
   bool persistent;
   /** The folder of projects: `PROJECTS` on its own, or the folder wac's desktop started it with. */
   string home;
-  /** The desktop that started it, which a build is noted on; `null` on a page of its own. */
+  /** The desktop that started it, which opens its windows; `null` on a page of its own. */
   Desktop? desk;
   Checker? check;
+  string checkerNote;
+  string[] projects;
+  /** The windows open, the first the page the program was started with. */
+  Vec<App> windows;
+  /** The state as it was read, until every window it names has been opened again. */
+  bool restoring;
+}
+
+/** One window: the projects screen, or a project's workbench. */
+struct App {
+  Shared s;
+  Page page;
+  /** Redraw this window; set by its component as it renders. */
+  fn<void()> redraw;
+  bool ready;
   /** The open project, or "" for the projects screen. */
   string project;
-  string[] projects;
   /** Each folder's entries, once listed, by path on the disk; and which folders are open. */
   Map<string, Entry[]> dirs;
   Map<string, bool> open;
@@ -74,19 +93,45 @@ struct App {
   string note;
   string error;
   string confirm;
-  string checkerNote;
+  /** The panel under the editors: "problems", or "output" — what the last Run or Test said. */
+  string panel;
+  Running run;
+  /** What the last run was, and how it ended, for the panel. */
+  string runWhat;
+  string runEnd;
+  /** A project whose card's own button was just clicked, which the card's click is not to open. */
+  string opening;
 }
 
-App newApp(Files fs, bool persistent) {
-  return App(fs, persistent, PROJECTS, null, null, "", string[](), Map.create(hashString, stringEq), Map.create(hashString, stringEq), "",
-             Vec.create(), -1, Diag[](), 0, "", "", false, false, true, 0, false, "", 0, string[](), false, 0, null, 0, 0, 0, "", "", "", "", "", "");
+App newApp(Shared s, Page page) {
+  return App(s, page, () => { }, false, "", Map.create(hashString, stringEq), Map.create(hashString, stringEq), "",
+             Vec.create(), -1, Diag[](), 0, "", "", false, false, true, 0, false, "", 0, string[](), false, 0, null, 0, 0, 0, "", "", "", "", "",
+             "problems", Running.none(), "", "", "");
+}
+
+/**
+ * Window `a` drawn again. Through a local, not `a.redraw()`: the emitter takes a call of a function a field holds for a
+ * method of that name, and refuses the module (docs/wac-wishlist.md, 12).
+ */
+void redraw(App a) {
+  fn<void()> f = a.redraw;
+  f();
+}
+
+/** Every window drawn again: what they share changed. */
+void everyone(Shared s) { for (i32 i = 0; i < s.windows.len(); i++) { redraw(s.windows.get(i)); } }
+
+/** The window `project` is open in, if one is. */
+App? windowFor(Shared s, string project) {
+  for (i32 i = 0; i < s.windows.len(); i++) { if (s.windows.get(i).project == project) { return s.windows.get(i); } }
+  return null;
 }
 
 Doc? activeDoc(App a) { return a.active >= 0 && a.active < a.docs.len() ? a.docs.get(a.active) : null; }
 
 /** A path on the disk, relative to the open project. */
 string rel(App a, string path) {
-  string root = rootOf(a.home, a.project) + "/";
+  string root = rootOf(a.s.home, a.project) + "/";
   return path.len() > root.len() && path.slice(0, root.len()) == root ? path.slice(root.len(), path.len()) : path;
 }
 
@@ -102,12 +147,46 @@ async i64 nowOf(Page page) {
 
 // ── remembering where we were ───────────────────────────────────────────────
 
+/**
+ * What was open, for the next start: each window — `window\t<project>\t<the file in front>` — and its tabs, a
+ * `tab\t<path>` each. Not while a start is still putting windows back, which would forget the ones not back yet.
+ */
 async void saveState(App a) {
-  string s = a.project + "\n";
-  Doc? d = activeDoc(a);
-  s = s + (d is null ? "" : d!.path) + "\n";
-  for (i32 i = 0; i < a.docs.len(); i++) { s = s + a.docs.get(i).path + "\n"; }
-  await write(a.fs, STATE, s.toBytes());
+  Shared sh = a.s;
+  if (sh.restoring) { return; }
+  string s = "";
+  for (i32 w = 0; w < sh.windows.len(); w++) {
+    App x = sh.windows.get(w);
+    Doc? d = activeDoc(x);
+    s = s + "window\t\{x.project}\t\{d is null ? "" : d!.path}\n";
+    for (i32 i = 0; i < x.docs.len(); i++) { s = s + "tab\t" + x.docs.get(i).path + "\n"; }
+  }
+  await write(sh.fs, STATE, s.toBytes());
+}
+
+/** One window as the state names it. */
+struct Remembered {
+  string project;
+  string active;
+  Vec<string> tabs;
+}
+
+/** The state read back — and the one-window state of before, a project, the file in front, then the tabs. */
+Remembered[] remembered(string text) {
+  string[] l = linesOf(text);
+  Vec<Remembered> out = Vec.create();
+  if (l.len() > 0 && l[0].indexOf("window\t") != 0) {
+    Vec<string> tabs = Vec.create();
+    for (i32 i = 2; i < l.len(); i++) { tabs.push(l[i]); }
+    out.push(Remembered(l[0], l.len() > 1 ? l[1] : "", tabs));
+    return out.toArray();
+  }
+  for (i32 i = 0; i < l.len(); i++) {
+    string[] f = tabbed(l[i]);
+    if (f.len() >= 2 && f[0] == "window") { out.push(Remembered(f[1], f.len() > 2 ? f[2] : "", Vec.create())); }
+    else if (f.len() >= 2 && f[0] == "tab" && out.len() > 0) { out.get(out.len() - 1).tabs.push(f[1]); }
+  }
+  return out.toArray();
 }
 
 string[] linesOf(string s) {
@@ -119,52 +198,124 @@ string[] linesOf(string s) {
   return out.toArray();
 }
 
-async void start(Page page, App a, fn<void()> bump) {
-  a.projects = await projects(a.fs, a.home);
-  Got st = await read(a.fs, STATE);
-  bump();
-  Checker c = await Checker.start(page.sys, a.fs, a.persistent);
-  a.check = c;
-  a.checkerNote = c.note;
+bool known(Shared s, string project) {
+  for (i32 i = 0; i < s.projects.len(); i++) { if (s.projects[i] == project) { return true; } }
+  return false;
+}
+
+/** Window `a` as `r` remembers it: its project, its tabs, and the file in front. */
+async void putBack(App a, Remembered r) {
+  fn<void()> bump = () => { redraw(a); };
+  await openProject(a, r.project, bump);
+  for (i32 i = 0; i < r.tabs.len(); i++) { await openFile(a, r.tabs.get(i), bump); }
+  for (i32 i = 0; i < a.docs.len(); i++) { if (a.docs.get(i).path == r.active) { a.active = i; } }
+  wantCheck(a, bump);
+}
+
+async void start(App a) {
+  Shared sh = a.s;
+  sh.projects = await projects(sh.fs, sh.home);
+  Got st = await read(sh.fs, STATE);
+  redraw(a);
+  Checker c = await Checker.start(sh.sys, sh.fs, sh.persistent);
+  sh.check = c;
+  sh.checkerNote = c.note;
   if (st.ok) {
-    string[] l = linesOf(string.fromBytes(st.bytes));
-    bool known = false;
-    for (i32 i = 0; i < a.projects.len(); i++) { if (l.len() > 0 && a.projects[i] == l[0]) { known = true; } }
-    if (known) {
-      await openProject(a, l[0], bump);
-      for (i32 i = 2; i < l.len(); i++) { await openFile(a, l[i], bump); }
-      for (i32 i = 0; i < a.docs.len(); i++) { if (l.len() > 1 && a.docs.get(i).path == l[1]) { a.active = i; } }
-      wantCheck(a, bump);
+    // The first window the program's own page; each after it a window of its own, where the desktop gives one.
+    sh.restoring = true;
+    Remembered[] rs = remembered(string.fromBytes(st.bytes));
+    bool first = true;
+    for (i32 i = 0; i < rs.len(); i++) {
+      if (rs[i].project != "" && !known(sh, rs[i].project)) { continue; }
+      if (first) {
+        first = false;
+        if (rs[i].project != "") { await putBack(a, rs[i]); }
+        continue;
+      }
+      if (sh.desk is null || rs[i].project == "") { continue; }
+      App? w = await newWindow(sh, rs[i].project);
+      if (w is not null) { await putBack(w!, rs[i]); }
+    }
+    sh.restoring = false;
+    saveState(a);
+  }
+  everyone(sh);
+}
+
+/**
+ * A window of its own for `project` (`Desktop.openWindow`), drawn and listening like the first, and forgotten when
+ * it is closed. `null` where there is no desktop to ask, or it has no window to give.
+ */
+async App? newWindow(Shared sh, string project) {
+  if (sh.desk is null) { return null; }
+  match (await sh.desk!.openWindow(project)) {
+    Ok(page): {
+      App w = newApp(sh, page);
+      w.ready = true;
+      sh.windows.push(w);
+      page.mount((Ui ui) => <Ide page={page} a={w}/>);
+      arrivals(page, w);
+      closing(w);
+      return w;
+    }
+    Err(why): { return null; }
+  }
+}
+
+/** When window `a` is closed: its edits saved, and it is forgotten — the rest go on. */
+async void closing(App a) {
+  await a.page.closed();
+  for (i32 i = 0; i < a.docs.len(); i++) {
+    Doc d = a.docs.get(i);
+    if (dirty(d)) { await write(a.s.fs, d.path, d.text.toBytes()); }
+  }
+  for (i32 i = 0; i < a.s.windows.len(); i++) {
+    if (a.s.windows.get(i) is a) {
+      a.s.windows.remove(i);
+      break;
     }
   }
-  bump();
+  saveState(a.s.windows.len() > 0 ? a.s.windows.get(0) : a);
+}
+
+/** Open `name` in a window of its own — or, where there is none to give, in `a`. */
+async void openInWindow(App a, string name, fn<void()> bump) {
+  App? there = windowFor(a.s, name);
+  if (there is not null) { a.note = "\{name} is open in a window already"; bump(); return; }
+  App? w = await newWindow(a.s, name);
+  if (w is null) { await openProject(a, name, bump); return; }
+  App opened = w!;
+  fn<void()> redrawIt = () => { redraw(opened); };
+  await openProject(opened, name, redrawIt);
 }
 
 // ── projects ────────────────────────────────────────────────────────────────
 
 async void openProject(App a, string name, fn<void()> bump) {
+  App? there = windowFor(a.s, name);
+  if (there is not null && !(there! is a)) { a.note = "\{name} is open in another window"; bump(); return; }
   a.project = name;
+  a.page.title(name);
   a.docs = Vec.create();
   a.active = -1;
   a.dirs = Map.create(hashString, stringEq);
   a.open = Map.create(hashString, stringEq);
-  a.open.set(rootOf(a.home, name), true);
+  a.open.set(rootOf(a.s.home, name), true);
   a.diags = Diag[]();
   a.diagSeq++;
   a.checkSummary = "";
-  a.selected = rootOf(a.home, name);
+  a.selected = rootOf(a.s.home, name);
   a.index = string[]();
-  if (a.check is not null) { a.check!.reset(); }
-  await listDir(a, rootOf(a.home, name), bump);
+  await listDir(a, rootOf(a.s.home, name), bump);
   // The finder's list of every file: written at import, made by walking the project otherwise.
-  Got idx = await read(a.fs, "ide/\{name}.files");
+  Got idx = await read(a.s.fs, "ide/\{name}.files");
   if (idx.ok) {
     a.index = linesOf(string.fromBytes(idx.bytes));
   } else {
     Vec<string> all = Vec.create();
-    await walk(a.fs, rootOf(a.home, name), "", all);
+    await walk(a.s.fs, rootOf(a.s.home, name), "", all);
     a.index = all.toArray();
-    await write(a.fs, "ide/\{name}.files", joinLines(a.index).toBytes());
+    await write(a.s.fs, "ide/\{name}.files", joinLines(a.index).toBytes());
   }
   saveState(a);
   bump();
@@ -177,16 +328,16 @@ string joinLines(string[] xs) {
 }
 
 async void listDir(App a, string dir, fn<void()> bump) {
-  a.dirs.set(dir, await list(a.fs, dir));
+  a.dirs.set(dir, await list(a.s.fs, dir));
   bump();
 }
 
 async void deleteProject(App a, string name, fn<void()> bump) {
-  await remove(a.fs, rootOf(a.home, name));
-  await remove(a.fs, "ide/\{name}.files");
-  a.projects = await projects(a.fs, a.home);
+  await remove(a.s.fs, rootOf(a.s.home, name));
+  await remove(a.s.fs, "ide/\{name}.files");
+  a.s.projects = await projects(a.s.fs, a.s.home);
   a.note = "Deleted \{name}";
-  bump();
+  everyone(a.s);
 }
 
 static string HELLO = """
@@ -200,17 +351,18 @@ export i32 main(Sys sys) {
 """;
 
 async void newProject(App a, fn<void()> bump) {
-  string name = projectName("hello", a.projects);
-  await write(a.fs, join(rootOf(a.home, name), "main.wac"), HELLO.toBytes());
-  await write(a.fs, "ide/\{name}.files", "main.wac\n".toBytes());
-  a.projects = await projects(a.fs, a.home);
+  string name = projectName("hello", a.s.projects);
+  await write(a.s.fs, join(rootOf(a.s.home, name), "main.wac"), HELLO.toBytes());
+  await write(a.s.fs, "ide/\{name}.files", "main.wac\n".toBytes());
+  a.s.projects = await projects(a.s.fs, a.s.home);
   await openProject(a, name, bump);
-  await openFile(a, join(rootOf(a.home, name), "main.wac"), bump);
+  await openFile(a, join(rootOf(a.s.home, name), "main.wac"), bump);
   wantCheck(a, bump);
 }
 
 /** Files arriving — a dropped or chosen folder, or an archive — gathered until they stop, then stored. */
-async void arrivals(Page page, App a, fn<void()> bump) {
+async void arrivals(Page page, App a) {
+  fn<void()> bump = () => { redraw(a); };
   Vec<Picked> batch = Vec.create();
   Ticket<Picked> next = page.nextFile();
   while (true) {
@@ -248,7 +400,7 @@ async void importBatch(Page page, App a, Vec<Picked> batch, fn<void()> bump) {
     string[] paths = string[].filled(files.len(), "");
     for (i32 i = 0; i < files.len(); i++) { paths[i] = files[i].path; }
     string top = commonTop(paths);
-    name = projectName(top != "" ? top : batch.get(0).name, a.projects);
+    name = projectName(top != "" ? top : batch.get(0).name, a.s.projects);
   } else {
     // A folder: its files, named by their paths inside it.
     Incoming[] fs2 = Incoming[].filled(batch.len(), Incoming("", u8[]()));
@@ -257,7 +409,7 @@ async void importBatch(Page page, App a, Vec<Picked> batch, fn<void()> bump) {
     string[] paths = string[].filled(files.len(), "");
     for (i32 i = 0; i < files.len(); i++) { paths[i] = files[i].path; }
     string top = commonTop(paths);
-    name = projectName(top != "" ? top : "project", a.projects);
+    name = projectName(top != "" ? top : "project", a.s.projects);
   }
   if (files.len() == 0) { a.importing = ""; a.error = "There was nothing to import."; bump(); return; }
   i64 t0 = await nowOf(page);
@@ -266,15 +418,16 @@ async void importBatch(Page page, App a, Vec<Picked> batch, fn<void()> bump) {
   string called = name;
   i32 total = files.len();
   fn<void(i32)> progress = (i32 done) => { a.importing = "Importing \{called}: \{done} of \{total} files…"; bump(); };
-  i32 n = await store(a.fs, a.home, name, files, progress);
+  i32 n = await store(a.s.fs, a.s.home, name, files, progress);
   // The finder's index, written once rather than walked for.
   string[] paths = string[].filled(files.len(), "");
   for (i32 i = 0; i < files.len(); i++) { paths[i] = files[i].path; }
   string top = commonTop(paths);
   for (i32 i = 0; i < paths.len(); i++) { if (top != "") { paths[i] = paths[i].slice(top.len() + 1, paths[i].len()); } }
-  await write(a.fs, "ide/\{name}.files", joinLines(paths).toBytes());
+  await write(a.s.fs, "ide/\{name}.files", joinLines(paths).toBytes());
   a.importing = "";
-  a.projects = await projects(a.fs, a.home);
+  a.s.projects = await projects(a.s.fs, a.s.home);
+  everyone(a.s);
   a.note = "Imported \{n} files as \{name} in \{(await nowOf(page) - t0) / 1000} s";
   await openProject(a, name, bump);
 }
@@ -299,7 +452,7 @@ async void openFile(App a, string path, fn<void()> bump) {
   a.selected = path;
   a.focusSeq++;
   bump();
-  Got f = await read(a.fs, path);
+  Got f = await read(a.s.fs, path);
   if (!f.ok) { a.error = "\{rel(a, path)} could not be read: \{f.error}"; closeTab(a, a.docs.len() - 1); bump(); return; }
   if (binary(f.bytes)) {
     d.binary = true;
@@ -328,8 +481,8 @@ async void flush(App a, fn<void()> bump) {
     Doc d = a.docs.get(i);
     if (!dirty(d)) { continue; }
     string text = d.text;
-    if (a.check is not null) { a.check!.put(d.path, text.toBytes()); }
-    string why = await write(a.fs, d.path, text.toBytes());
+    if (a.s.check is not null) { a.s.check!.put(d.path, text.toBytes()); }
+    string why = await write(a.s.fs, d.path, text.toBytes());
     if (why == "") { d.saved = text; } else { a.error = "\{rel(a, d.path)} could not be saved: \{why}"; }
     any = true;
   }
@@ -345,16 +498,16 @@ async void newFile(App a, string name, fn<void()> bump) {
   bool isDir = a.dirs.get(dir) is not null;
   if (!isDir) { dir = parentOf(dir); }
   string path = join(dir, name);
-  Got there = await read(a.fs, path);
+  Got there = await read(a.s.fs, path);
   if (there.ok) { a.error = "\{rel(a, path)} already exists"; bump(); return; }
-  string why = await write(a.fs, path, (isWac(path) ? "// \{leafOf(path)}\n" : "").toBytes());
+  string why = await write(a.s.fs, path, (isWac(path) ? "// \{leafOf(path)}\n" : "").toBytes());
   if (why != "") { a.error = why; bump(); return; }
   a.open.set(dir, true);
   await listDir(a, dir, bump);
   Vec<string> idx = Vec.fromArray(a.index);
   idx.push(rel(a, path));
   a.index = idx.toArray();
-  write(a.fs, "ide/\{a.project}.files", joinLines(a.index).toBytes());
+  write(a.s.fs, "ide/\{a.project}.files", joinLines(a.index).toBytes());
   await openFile(a, path, bump);
 }
 
@@ -367,7 +520,7 @@ void wantCheck(App a, fn<void()> bump) {
 }
 
 async void checkLoop(App a, fn<void()> bump) {
-  if (a.check is null) { return; }
+  if (a.s.check is null) { return; }
   a.checking = true;
   while (a.checkWanted) {
     a.checkWanted = false;
@@ -375,7 +528,7 @@ async void checkLoop(App a, fn<void()> bump) {
     string entry = (d is not null) && isWac(d!.path) ? d!.path : a.checkedEntry;
     if (entry == "") { break; }
     bump();
-    Outcome o = await a.check!.run("check", entry);
+    Outcome o = await a.s.check!.run("check", entry);
     a.checkedEntry = entry;
     if (o.kind == "check") {
       a.diags = parseWire(string.fromBytes(o.bytes));
@@ -393,24 +546,24 @@ async void checkLoop(App a, fn<void()> bump) {
 
 async void build(Page page, App a, fn<void()> bump) {
   Doc? d = activeDoc(a);
-  if ((d is null) || !isWac(d!.path) || a.check is null) { return; }
+  if ((d is null) || !isWac(d!.path) || a.s.check is null) { return; }
   await flush(a, bump);
   a.note = "Building \{leafOf(d!.path)}…";
   bump();
   while (a.checking) { await page.sleep(50); }
   a.checking = true;
-  Outcome o = await a.check!.run("build", d!.path);
+  Outcome o = await a.s.check!.run("build", d!.path);
   a.checking = false;
   if (o.kind == "wasm") {
     string stem = leafOf(d!.path).slice(0, leafOf(d!.path).len() - 4);
     string made = "\{o.bytes.len() / 1024} KB from \{o.files} files in \{o.ms} ms";
-    if (a.desk is null) {
+    if (a.s.desk is null) {
       page.download("\{stem}.wasm", o.bytes);
       a.note = "Built \{stem}.wasm — \{made}";
     } else {
       // **On wac's desktop the module goes beside its source**, where Files shows it and a double-click runs it.
       string out = join(parentOf(d!.path), "\{stem}.wasm");
-      string why = await write(a.fs, out, o.bytes);
+      string why = await write(a.s.fs, out, o.bytes);
       if (why == "") {
         a.note = "Built \{rel(a, out)} — \{made}";
         await listDir(a, parentOf(d!.path), bump);
@@ -423,6 +576,76 @@ async void build(Page page, App a, fn<void()> bump) {
     a.error = "\{leafOf(d!.path)} did not build: \{string.fromBytes(o.bytes)}";
   }
   wantCheck(a, bump);
+  bump();
+}
+
+// ── running and testing ─────────────────────────────────────────────────────
+
+/** The program `entry` builds into, or why there is none: the checker builds it, after the check it is doing. */
+async u8[] built(Page page, App a, string entry, fn<void()> bump) {
+  while (a.checking) { await page.sleep(50); }
+  a.checking = true;
+  Outcome o = await a.s.check!.run("build", entry);
+  a.checking = false;
+  if (o.kind == "wasm") { return o.bytes; }
+  a.runEnd = "did not build: " + string.fromBytes(o.bytes);
+  return u8[]();
+}
+
+/** Show the output panel for a run of `what`, starting. */
+void starting(App a, string what, fn<void()> bump) {
+  a.run.stop();
+  a.panel = "output";
+  a.problems = true;
+  a.runWhat = what;
+  a.runEnd = "";
+  a.run = Running(null, "", false, 0 - 1);
+  bump();
+}
+
+/** Run the file in front: built, then started in its project's folder, its output in the panel as it comes. */
+async void runIt(Page page, App a, fn<void()> bump) {
+  Doc? d = activeDoc(a);
+  if ((d is null) || !isWac(d!.path) || a.s.check is null) { return; }
+  await flush(a, bump);
+  string path = d!.path;
+  starting(a, "Running \{leafOf(path)}", bump);
+  u8[] wasm = await built(page, a, path, bump);
+  if (wasm.len() == 0) { wantCheck(a, bump); bump(); return; }
+  fn<void()> ended = () => {
+    a.runEnd = a.run.status < 0 ? "ended without a status: it trapped, or was stopped" : "exited with \{a.run.status}";
+    bump();
+  };
+  a.run = await startRun(a.s.sys, wasm, string[](), a.s.fs, rootOf(a.s.home, a.project), bump, ended);
+  bump();
+}
+
+/**
+ * Test the file in front: its `test…` functions, called by a runner the IDE writes beside it — handed to the checker
+ * as a file's contents, never written — built and started like Run.
+ */
+async void testIt(Page page, App a, fn<void()> bump) {
+  Doc? d = activeDoc(a);
+  if ((d is null) || !isWac(d!.path) || a.s.check is null) { return; }
+  await flush(a, bump);
+  string path = d!.path;
+  Test[] tests = testsIn(d!.text);
+  if (tests.len() == 0) { a.note = "\{leafOf(path)} exports no test functions"; bump(); return; }
+  starting(a, "Testing \{leafOf(path)}", bump);
+  string runner = join(parentOf(path), "__wac_ide_tests__.wac");
+  a.s.check!.put(runner, runnerSource(leafOf(path), tests).toBytes());
+  u8[] wasm = await built(page, a, runner, bump);
+  a.s.check!.forget(runner);
+  if (wasm.len() == 0) { wantCheck(a, bump); bump(); return; }
+  fn<void()> ended = () => {
+    string inside = trappedIn(tests, a.run.output);
+    if (a.run.status == 0) { a.runEnd = "every test passed"; }
+    else if (a.run.status == 1 && inside == "") { a.runEnd = "some tests failed"; }
+    else { a.runEnd = inside == "" ? "the run ended without finishing" : "stopped in \{inside}: it trapped, or was stopped"; }
+    if (a.run.status == 0) { a.note = a.runEnd; } else { a.error = a.runEnd; }
+    bump();
+  };
+  a.run = await startRun(a.s.sys, wasm, string[](), a.s.fs, rootOf(a.s.home, a.project), bump, ended);
   bump();
 }
 
@@ -450,9 +673,9 @@ bool onName(string text, i32 at) {
 
 /** What the checker says is at byte `at` of `d` — after it has been sent what is on screen. */
 async Info? askAbout(App a, Doc d, i32 at, fn<void()> bump) {
-  if (a.check is null || !isWac(d.path) || !onName(d.text, at)) { return null; }
+  if (a.s.check is null || !isWac(d.path) || !onName(d.text, at)) { return null; }
   if (dirty(d)) { await flush(a, bump); }
-  Outcome o = await a.check!.run("query", "\{d.path}\t\{at}");
+  Outcome o = await a.s.check!.run("query", "\{d.path}\t\{at}");
   if (o.kind != "query") { return null; }
   return parseInfo(d.path, string.fromBytes(o.bytes));
 }
@@ -541,7 +764,7 @@ Node finder(App a, Ref field, fn<void()> bump) {
   for (i32 i = 0; i < hs.len(); i++) {
     string p = hs[i];
     rows[i] = <div class={i == a.hit ? "hit on" : "hit"} key={p}
-                   onclick={(ElementEvent e) => { a.finding = false; openFile(a, join(rootOf(a.home, a.project), p), bump); }}>
+                   onclick={(ElementEvent e) => { a.finding = false; openFile(a, join(rootOf(a.s.home, a.project), p), bump); }}>
       {icon(isWac(p) ? "wac" : "file", "sm")}<span>{leafOf(p)}</span><span class="dir">{parentOf(p)}</span></div>;
   }
   return <div class="veil" onclick={(ElementEvent e) => { a.finding = false; bump(); }}>
@@ -553,7 +776,7 @@ Node finder(App a, Ref field, fn<void()> bump) {
                if (e.value == "ArrowDown") { a.hit++; bump(); }
                else if (e.value == "ArrowUp") { a.hit--; bump(); }
                else if (e.value == "Escape") { a.finding = false; a.focusSeq++; bump(); }
-               else if (e.value == "Enter" && hs.len() > 0) { a.finding = false; openFile(a, join(rootOf(a.home, a.project), hs[a.hit]), bump); }
+               else if (e.value == "Enter" && hs.len() > 0) { a.finding = false; openFile(a, join(rootOf(a.s.home, a.project), hs[a.hit]), bump); }
              }}/>
       <div class="hits">{hs.len() == 0 ? <div class="pnone">No file matches.</div> : Node.Text("")}{rows}</div>
     </div>
@@ -610,12 +833,32 @@ Node problemsPanel(App a, fn<void()> bump) {
       <span class="pos">{"\{g.line}:\{g.col}"}</span></div>);
   }
   return <div class="problems">
-    <div class="phead">Problems <span class="spacer"></span>
-      <button class="btn ghost" title="Hide" onclick={(ElementEvent e) => { a.problems = false; bump(); }}>{icon("close", "sm")}</button></div>
+    {panelHead(a, bump)}
     <div class="plist">
       {a.diags.len() == 0 ? <div class="pnone">{a.checkedEntry == "" ? "Open a .wac file to check it." : "No problems in \{leafOf(a.checkedEntry)} or anything it imports."}</div> : Node.Text("")}
       {rows.toArray()}
     </div>
+  </div>;
+}
+
+/** The panel's head: Problems and Output, Stop while something runs, and Hide. */
+Node panelHead(App a, fn<void()> bump) {
+  return <div class="phead">
+    <button class={a.panel == "problems" ? "ptab on" : "ptab"} onclick={(ElementEvent e) => { a.panel = "problems"; bump(); }}>Problems</button>
+    <button class={a.panel == "output" ? "ptab on" : "ptab"} onclick={(ElementEvent e) => { a.panel = "output"; bump(); }}>Output</button>
+    <span class="spacer"></span>
+    {a.panel == "output" && !a.run.done
+      ? <button class="btn ghost stop" title="Stop it" onclick={(ElementEvent e) => { a.run.stop(); bump(); }}>{icon("stop", "sm")}Stop</button>
+      : Node.Text("")}
+    <button class="btn ghost" title="Hide" onclick={(ElementEvent e) => { a.problems = false; bump(); }}>{icon("close", "sm")}</button></div>;
+}
+
+/** What the last Run or Test said, as it came, and how it ended. */
+Node outputPanel(App a, fn<void()> bump) {
+  bool bad = a.runEnd != "" && a.runEnd != "every test passed" && a.runEnd != "exited with 0";
+  return <div class="problems">
+    {panelHead(a, bump)}
+    <pre class="output mono">{a.runWhat == "" ? "Run or Test the file in front, and what it says is shown here.\n" : a.runWhat + "\n"}{a.run.output}{a.runEnd != "" ? <span class={bad ? "ended bad" : "ended"}>{"— " + a.runEnd + "\n"}</span> : Node.Text(a.run.done || a.runWhat == "" ? "" : "…")}</pre>
   </div>;
 }
 
@@ -624,7 +867,7 @@ async void jumpTo(App a, string path, i32 line, i32 col, fn<void()> bump) {
   await openFile(a, path, bump);
   Doc? d = activeDoc(a);
   if (d is null || d!.path != path) { return; }
-  while (!d!.loaded && a.check is not null) { await a.check!.sleep(20); }
+  while (!d!.loaded && a.s.check is not null) { await a.s.check!.sleep(20); }
   d!.jumpLine = line;
   d!.jumpByte = offsetOf(d!, line, col);
   d!.jumpSeq++;
@@ -659,7 +902,7 @@ Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
     errs.set(a.diags[i].file, n is null ? 1 : n! + 1);
   }
   Vec<Node> tree = Vec.create();
-  treeRows(a, rootOf(a.home, a.project), 0, errs, tree, bump);
+  treeRows(a, rootOf(a.s.home, a.project), 0, errs, tree, bump);
   Node[] tabs = Node[].filled(a.docs.len(), Node.Text(""));
   Node[] editors = Node[].filled(a.docs.len(), Node.Text(""));
   for (i32 i = 0; i < a.docs.len(); i++) {
@@ -682,11 +925,15 @@ Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
   return <>
     <div class="top">
       <span class="brand">{icon("logo", "")}</span>
-      <button class="proj" title="All projects" onclick={(ElementEvent e) => { flush(a, bump); a.project = ""; saveState(a); bump(); }}>
+      <button class="proj" title="All projects" onclick={(ElementEvent e) => { flush(a, bump); a.project = ""; a.docs = Vec.create(); a.active = -1; a.page.title("wac IDE"); saveState(a); bump(); }}>
         {icon("back", "sm")}<span>Projects /</span><b>{a.project}</b></button>
       <span class="spacer"></span>
       {statusPill(a, bump)}
       <button class="btn" title="Go to a file (Ctrl+P)" onclick={(ElementEvent e) => { a.finding = true; a.query = ""; bump(); }}>{icon("search", "sm")}Go to file</button>
+      <button class="btn" disabled={(d is not null) && isWac(d!.path) && testsIn(d!.text).len() > 0 ? null : ""}
+              title="Run the file in front's test functions" onclick={(ElementEvent e) => { testIt(page, a, bump); }}>{icon("flask", "sm")}Test</button>
+      <button class="btn" disabled={(d is not null) && isWac(d!.path) ? null : ""} title="Build the file in front and run it, in its project's folder"
+              onclick={(ElementEvent e) => { runIt(page, a, bump); }}>{icon("play", "sm")}Run</button>
       <button class="btn primary" disabled={(d is not null) && isWac(d!.path) ? null : ""} title="Compile the file in front to a .wasm module"
               onclick={(ElementEvent e) => { build(page, a, bump); }}>{icon("build", "sm")}Build</button>
     </div>
@@ -710,13 +957,13 @@ Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
         </div>
       </div>
     </div>
-    {a.problems ? problemsPanel(a, bump) : <div></div>}
+    {a.problems ? (a.panel == "output" ? outputPanel(a, bump) : problemsPanel(a, bump)) : <div></div>}
     <div class="bar">
       {a.caretAt != "" && (d is not null) ? <span>{a.caretAt}</span> : Node.Text("")}
       <span>{a.checkSummary}</span>
-      {a.checkerNote != "" ? <span class="warnnote">{a.checkerNote}</span> : Node.Text("")}
+      {a.s.checkerNote != "" ? <span class="warnnote">{a.s.checkerNote}</span> : Node.Text("")}
       <span class="spacer"></span>
-      <span>{a.persistent ? "Saved in this browser" : "Not saved: opened from a file"}</span>
+      <span>{a.s.persistent ? "Saved in this browser" : "Not saved: opened from a file"}</span>
     </div>
   </>;
 }
@@ -724,12 +971,23 @@ Node workbench(Page page, App a, Ref nameRef, fn<void()> bump) {
 // ── the projects screen ─────────────────────────────────────────────────────
 
 Node home(App a, fn<void()> bump) {
-  Node[] cards = Node[].filled(a.projects.len(), Node.Text(""));
-  for (i32 i = 0; i < a.projects.len(); i++) {
-    string n = a.projects[i];
+  Node[] cards = Node[].filled(a.s.projects.len(), Node.Text(""));
+  for (i32 i = 0; i < a.s.projects.len(); i++) {
+    string n = a.s.projects[i];
     bool asking = a.confirm == n;
-    cards[i] = <div class="pcard" key={n} onclick={(ElementEvent e) => { if (a.confirm == "") { openProject(a, n, bump); } }}>
+    App? there = windowFor(a.s, n);
+    // A click on a button inside the card reaches the card after the button: the button marks it as its own (the
+    // trash, by asking; opening a window, in `opening`), and the card leaves it be.
+    cards[i] = <div class="pcard" key={n} onclick={(ElementEvent e) => {
+      if (a.opening == n) { a.opening = ""; return; }
+      if (a.confirm == "") { openProject(a, n, bump); }
+    }}>
       {icon("folder", "")}<span class="nm">{n}</span>
+      {there is not null ? <span class="opened">open</span> : Node.Text("")}
+      {a.s.desk is not null && there is null
+        ? <button class="btn ghost" title="Open in a window of its own"
+                  onclick={(ElementEvent e) => { a.opening = n; openInWindow(a, n, bump); }}>{icon("panel", "sm")}</button>
+        : Node.Text("")}
       <button class={asking ? "btn danger" : "btn ghost"} title="Delete this project from the browser"
               onclick={(ElementEvent e) => { if (asking) { a.confirm = ""; deleteProject(a, n, bump); } else { a.confirm = n; bump(); } }}>
         {icon("trash", "sm")}{asking ? "Delete for good?" : ""}</button>
@@ -748,18 +1006,17 @@ Node home(App a, fn<void()> bump) {
       </div>
       {a.importing != "" ? <div class="progress">{icon("spin", "sm spin")}{a.importing}</div> : Node.Text("")}
     </div>
-    {a.projects.len() > 0 ? <div class="h2">Your projects</div> : Node.Text("")}
+    {a.s.projects.len() > 0 ? <div class="h2">Your projects</div> : Node.Text("")}
     <div class="plist2">{cards}</div>
   </div></div>;
 }
 
 // ── the page ────────────────────────────────────────────────────────────────
 
-Node Ide(Ui ui, Page page) {
-  App a = ui.memo<App>("", () => newApp(MemoryStore.create(page.sys.clock()).asUser("root"), false));
+Node Ide(Ui ui, Page page, App a) {
   auto version = ui.state(0);
-  auto ready = ui.state(false);
   fn<void()> bump = () => { version.update((i32 v) => v + 1); };
+  a.redraw = bump;
   // Keys reach the app's handler only from inside it, so it takes the focus when it starts and whenever
   // a project opens — a page has no way to listen to the whole document.
   Ref root = ui.ref();
@@ -774,12 +1031,8 @@ Node Ide(Ui ui, Page page) {
     if (a.naming && nameRef.element() is not null) { nameRef.element()!.focus(); }
     return () => { };
   });
-  ui.effect("\{ready.get()}|\{a.project}", () => {
+  ui.effect("\{a.ready}|\{a.project}", () => {
     if (root.element() is not null && activeDoc(a) is null) { root.element()!.focus(); }
-    return () => { };
-  });
-  ui.effect("", () => {
-    begin(page, a, bump, () => { ready.set(true); });
     return () => { };
   });
   // What the name at the caret is, once the caret has rested there a moment.
@@ -811,7 +1064,7 @@ Node Ide(Ui ui, Page page) {
                 else if (e.value == "Escape" && a.info is not null) { a.info = null; a.infoSeq++; bump(); }
               }}>
     <style>{css()}</style>
-    {!ready.get() ? <div class="home"><div class="progress">{icon("spin", "sm spin")}Starting…</div></div>
+    {!a.ready ? <div class="home"><div class="progress">{icon("spin", "sm spin")}Starting…</div></div>
                   : (a.project == "" ? home(a, bump) : workbench(page, a, nameRef, bump))}
     {a.finding ? finder(a, findRef, bump) : Node.Text("")}
     {a.error != "" ? <div class="toast bad">{icon("alert", "sm")}<span>{a.error}</span></div>
@@ -824,23 +1077,31 @@ Node Ide(Ui ui, Page page) {
  * with a folder as its argument, its projects are that folder's folders, on the desktop's disk, where Files and the
  * Terminal see them too.
  */
-async void begin(Page page, App a, fn<void()> bump, fn<void()> ready) {
+async void begin(Page page, App a) {
+  Shared sh = a.s;
   string[] args = page.sys.args();
-  if (args.len() > 0 && args[0] != "") { a.home = args[0]; }
+  if (args.len() > 0 && args[0] != "") { sh.home = args[0]; }
   match (await Desktop.of(page.sys)) {
-    Ok(d): { a.desk = d; }
+    Ok(d): { sh.desk = d; }
     Err(why): { }
   }
-  a.persistent = (await page.sys.files().mkdir(a.home, true)).isOk();
-  a.fs = a.persistent ? page.sys.files() : MemoryStore.create(page.sys.clock()).asUser("root");
-  if (!a.persistent) { await a.fs.mkdir(a.home, true); }
-  await start(page, a, bump);
-  ready();
-  arrivals(page, a, bump);
+  sh.persistent = (await page.sys.files().mkdir(sh.home, true)).isOk();
+  sh.fs = sh.persistent ? page.sys.files() : MemoryStore.create(page.sys.clock()).asUser("root");
+  if (!sh.persistent) { await sh.fs.mkdir(sh.home, true); }
+  await start(a);
+  a.ready = true;
+  redraw(a);
+  arrivals(page, a);
+  closing(a);
 }
 
 export async i32 main(Page page) {
   page.title("wac IDE");
-  page.mount((Ui ui) => <Ide page={page}/>);
+  Shared sh = Shared(page.sys, MemoryStore.create(page.sys.clock()).asUser("root"), false, PROJECTS, null, null, "",
+                     string[](), Vec.create(), false);
+  App a = newApp(sh, page);
+  sh.windows.push(a);
+  page.mount((Ui ui) => <Ide page={page} a={a}/>);
+  begin(page, a);
   return 0;
 }

@@ -15,7 +15,14 @@ checking your code as you type. Built for real projects, up to the wac repositor
   through imports, to a field or a method by the type of what it is on.
 - **Typing**: Tab indents and Enter keeps the indent (one more after `{`, `(` or `[`), both undoable with
   Ctrl+Z; the status bar says where the caret is. Clicking a problem puts the caret on it.
-- **Build** compiles the file in front and downloads the `.wasm` module.
+- **Run** builds the file in front and starts it, in its project's folder with the project's files, its output in
+  the **Output** panel as it comes, Stop to end it. **Test** runs the file's `test…` functions — those taking
+  nothing or `Sys` — as `wac test` does: each `ok` or `FAIL` with why, and the test a trap stopped in named.
+- **Build** compiles the file in front to a module that describes itself, as `wac build` writes one, and downloads
+  it — or, on wac's desktop, writes it beside its source, where opening it runs it.
+- **On wac's desktop, a project can have a window of its own**: the window button on a project's card. Every
+  window is the one IDE — one checker, warm for all of them, and a project open in one window at a time — and a
+  reload brings them all back. The launcher brings the IDE forward rather than starting a second.
 - **Ctrl+P** goes to any file by name; **+** makes a new file in the selected folder.
 
 ## Trying it
@@ -58,7 +65,8 @@ Measured in headless Chromium (`tools/ide_scale.js`):
 
 | | |
 |---|---|
-| `src/ide.wac` | the page: projects, the tree, tabs, problems, the finder, saving, checking, building; and `checker`, the export the checker's process runs |
+| `src/ide.wac` | the windows: projects, the tree, tabs, problems and output, the finder, saving, checking, building; what they share; and `checker`, the export the checker's process runs |
+| `src/run.wac` | Run and Test: a program started for the IDE and its output; the runner written around a file's tests |
 | `src/checker.wac` | the checker: the compiler and the `wac` command's gathering, with every file kept between checks; the messages between it and the page; the same engine run in the page where there is no process |
 | `src/editor.wac` | the editor: a transparent textarea over the coloured text, in chunks of 50 lines; diagnostics on their lines |
 | `src/highlight.wac` | colours, from the compiler's lexer |

@@ -27,7 +27,10 @@ string icons() {
     ".i-back { --i: " + svg("<path d='M15 5.5 8.5 12l6.5 6.5'/>") + "; }" +
     ".i-panel { --i: " + svg("<rect x='3.5' y='4.5' width='17' height='15' rx='2'/><path d='M3.5 14.5h17'/>") + "; }" +
     ".i-logo { --i: " + svg("<path d='M4 7l3.2 10L10 9.5 12.8 17 16 7'/><path d='M17.5 7.5h3M19 6v3'/>") + "; }" +
-    ".i-spin { --i: " + svg("<path d='M12 3.5a8.5 8.5 0 1 0 8.5 8.5'/>") + "; }";
+    ".i-spin { --i: " + svg("<path d='M12 3.5a8.5 8.5 0 1 0 8.5 8.5'/>") + "; }" +
+    ".i-play { --i: " + svg("<path d='M8 5.5v13l10.5-6.5z'/>") + "; }" +
+    ".i-flask { --i: " + svg("<path d='M9.5 3.5h5M10.5 3.5v6L5.5 19a1.2 1.2 0 0 0 1 1.5h11a1.2 1.2 0 0 0 1-1.5l-5-9.5v-6M8 14.5h8'/>") + "; }" +
+    ".i-stop { --i: " + svg("<rect x='6.5' y='6.5' width='11' height='11' rx='1.5'/>") + "; }";
 }
 
 export string css() {
@@ -167,6 +170,11 @@ export string css() {
     .problems { border-top: 1px solid var(--line); background: var(--panel); height: 200px; display: flex; flex-direction: column; min-height: 0; }
     .phead { display: flex; align-items: center; gap: 8px; padding: 6px 12px; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
     .plist { flex: 1; overflow: auto; padding-bottom: 8px; }
+    .ptab { border: 0; background: transparent; font: inherit; letter-spacing: inherit; text-transform: inherit; color: var(--faint); cursor: pointer; padding: 2px 6px; border-radius: 6px; }
+    .ptab.on { color: var(--text); background: var(--hover); }
+    .output { flex: 1; overflow: auto; margin: 0; padding: 4px 14px 10px; font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+    .output .ended { color: var(--muted); }
+    .output .ended.bad { color: var(--err); }
     .pfile { display: flex; align-items: center; gap: 6px; padding: 4px 12px; font-weight: 650; color: var(--text); }
     .pfile .where { color: var(--faint); font-weight: 500; font-size: 12px; }
     .prow { display: flex; align-items: baseline; gap: 8px; padding: 3px 12px 3px 32px; cursor: pointer; }
@@ -204,6 +212,7 @@ export string css() {
     .drop p { margin: 6px 0 0; color: var(--muted); }
     .plist2 { margin-top: 22px; display: grid; gap: 8px; }
     .pcard { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); cursor: pointer; }
+    .pcard .opened { font-size: 11px; font-weight: 600; color: var(--accent); background: var(--accent-soft); padding: 1px 7px; border-radius: 99px; }
     .pcard:hover { border-color: var(--accent); }
     .pcard .nm { font-weight: 650; flex: 1; }
     .h2 { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin: 22px 0 8px; }

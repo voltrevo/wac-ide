@@ -31,7 +31,21 @@
 import { Map, Ticket, Vec, hashString, stringEq } from "core";
 import { Authority, Child, Clock, Env, Files, Input, Launch, Output, Sys } from "std";
 import { wac.ReadCache, wac.Sources, wac.exactly, wac.gatherNeeded, wac.gatherWith, wac.resOf } from "wac";
-import { wacc.PositionFacts, wacc.blockedFilesIn, wacc.diagnoseGraphIn, wacc.emitFilesIn, wacc.factsAt } from "wac";
+import { wacc.PositionFacts, wacc.blockedFilesIn, wacc.diagnoseGraphIn, wacc.emitFilesSelfDescribingIn, wacc.factsAt } from "wac";
+
+/**
+ * What a module the IDE builds asks to be handed: read (1), write (2) and run (16) — what Run hands it, the project's
+ * files and the starting of programs. Written into its manifest, which a page's host reads before it starts one.
+ */
+static i32 BUILT_GRANTS = 19;
+
+/** The file a module built from `entry` is written as: its name, `.wac` for `.wasm`. */
+string wasmNameOf(string entry) {
+  i32 k = entry.len() - 1;
+  while (k >= 0 && entry.slice(k, k + 1) != "/") { k--; }
+  string leaf = entry.slice(k + 1, entry.len());
+  return (leaf.len() > 4 && leaf.slice(leaf.len() - 4, leaf.len()) == ".wac" ? leaf.slice(0, leaf.len() - 4) : leaf) + ".wasm";
+}
 
 /** What a check or a build came to. */
 export struct Outcome {
@@ -111,7 +125,9 @@ export struct Engine {
       string wire = diagnoseGraphIn(paths, texts, resOf(s), entry);
       return Outcome("check", id, s.n, (await now(this.clock) - t0) as! i32, wire.toBytes());
     }
-    u8[] wasm = emitFilesIn(paths, texts, resOf(s), entry);
+    // **A module that describes itself**, as `wac build` writes one: a page's host starts nothing else, and on wac's
+    // desktop the module Build writes runs when it is opened.
+    u8[] wasm = emitFilesSelfDescribingIn(paths, texts, resOf(s), entry, wasmNameOf(entry), BUILT_GRANTS);
     i32 total = (await now(this.clock) - t0) as! i32;
     if (wasm.len() == 0) {
       string why = blockedFilesIn(paths, texts, resOf(s), entry);
