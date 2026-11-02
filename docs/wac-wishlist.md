@@ -4,7 +4,7 @@ Kept as the IDE is built: each item says what it would enable, what the IDE does
 where in wac it lives. Most important first. Measured against wac `25a34468`.
 
 **Items 1, 3, 4, 6 and 7 are in wac now** (2026-11-01): the IDE is built against wac master and `web` at
-git.voltrevo.com, and `wac-patches/` is gone. Item 4 went in as `factsAt`, which answers from the checker itself
+GitHub (`voltrevo/wac`, `voltrevo/wac-web`), and `wac-patches/` is gone. Item 4 went in as `factsAt`, which answers from the checker itself
 rather than from a second resolver over the syntax.
 
 ## For the editor

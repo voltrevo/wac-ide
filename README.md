@@ -43,11 +43,11 @@ disk (`file://`) it still works, but keeps nothing after the tab closes, and che
 typing can pause during a long check.
 
 **Everything is pinned in `wac.lock`**: wac, whose root library brings the compiler (`wacc`) and the `wac`
-command's gathering (`wac`), and `web`, the page and its builder — both on git.voltrevo.com, which answers
-`wac update` 401, so `tools/fill-cache.sh` fetches them with `git`. The `wac` command should be built from the
-pinned wac commit.
+command's gathering (`wac`), and `web`, the page and its builder (wac-web) — both on GitHub,
+`https://github.com/voltrevo/`, where `wac update` fetches them. The `wac` command should be built from the pinned
+wac commit.
 
-**On wac's desktop** (https://git.voltrevo.com/wac-desktop.git) it is a program like the desktop's own apps,
+**On wac's desktop** (https://github.com/voltrevo/wac-desktop) it is a program like the desktop's own apps,
 started with a folder of the desktop's disk as its argument: its projects are that folder's folders, which Files
 and the Terminal see too; what it keeps for itself goes in its own folder; and Build writes the module beside
 its source, where a double-click runs it. On its own, its projects are in `/projects` in the browser's storage.

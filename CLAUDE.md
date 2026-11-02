@@ -7,7 +7,7 @@ what it would like from wac — keep it current, it is how this project talks to
 
 - **The remote is `https://git.voltrevo.com/wac-ide.git`, `master`** (the server's default branch, `main`, is
   empty). Push finished work through `tools/push.sh`, which checks and tests first; nothing goes to GitHub
-  unless the owner says so.
+  unless the owner says so — the owner syncs the same commits to `https://github.com/voltrevo/wac-ide.git`.
 - When wac lacks something: work around it here, and add an entry to `docs/wac-wishlist.md` saying what
   it would enable, what the workaround is, and where in wac it lives. Bugs get a minimal reproduction.
 - Comments explain *why*, in full sentences. Match the surrounding style.
@@ -15,7 +15,9 @@ what it would like from wac — keep it current, it is how this project talks to
 ## Building and testing
 
 wac and `web` are pinned in `wac.json5` and `wac.lock` (change them together), and the `wac` command should be
-built from the wac commit. `wac update` cannot fetch from git.voltrevo.com; `tools/fill-cache.sh` does, with `git`.
+built from the wac commit. **Pins name GitHub**; development fetches them from git.voltrevo.com, which has the
+commits first, through one git setting — `sh tools/use-mirror.sh`, once per machine — which `wac update`'s own
+fetcher does not follow, so `tools/fill-cache.sh` fetches them with `git`.
 
     sh tools/fill-cache.sh && wac task build && wac task test && wac task test:ide
 
