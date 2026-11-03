@@ -7,8 +7,8 @@
     // compiler and the `wac` command's gathering among them, which this project used to copy into vendor/.
     wac: { git: 'https://github.com/voltrevo/wac.git', ref: '84955c78c187a9c5f0c5be13d6666927c7fbdcef' },
     // The page a program is handed — `import { Page, Desktop } from "web"` — a repository of its own since 2026-10-29.
-    web: { git: 'https://github.com/voltrevo/wac-web.git', ref: 'f474bfbdbbed3e51c13b1e7aa392871d0af3ed79' },
+    web: { git: 'https://github.com/voltrevo/wac-web.git', ref: '82a20ace2b6dd1071be11cb9ce9eb286c0a3f6d2' },
     // The page builder `build.wac` calls.
-    webbuild: { git: 'https://github.com/voltrevo/wac-web.git', ref: 'f474bfbdbbed3e51c13b1e7aa392871d0af3ed79', subdir: './tools' },
+    webbuild: { git: 'https://github.com/voltrevo/wac-web.git', ref: '82a20ace2b6dd1071be11cb9ce9eb286c0a3f6d2', subdir: './tools' },
   },
 }
