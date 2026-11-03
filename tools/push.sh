@@ -22,9 +22,9 @@ branch="$(git rev-parse --abbrev-ref HEAD)"
 for attempt in 1 2 3; do
   git fetch -q origin "$branch" 2>/dev/null && { git merge -q --no-edit "origin/$branch" || exit 1; }
   sh tools/fill-cache.sh || exit 1
-  # **check and test run beside build and test:ide**, which is the long half: test:ide is about 95s and needs only
+  # **check and test run beside build and test:ide**, which is the long half: test:ide is about 35s and needs only
   # dist/, and check and test read the sources and write nothing either of the others reads. Measured on 4 cores,
-  # 2026-11-03: the four in a row were about 138s, and this is about the build plus test:ide.
+  # 2026-11-03: the four in a row were about 138s, and this is about the build plus test:ide (about 60s now).
   out="$(mktemp -d)"
   "$WAC" check src/ide.wac > "$out/check" 2>&1 & checkPid=$!
   "$WAC" task test > "$out/test" 2>&1 & testPid=$!

@@ -30,6 +30,10 @@ const check = (ok, what, seen) => { if (!ok) failed++; console.log(`${ok ? 'ok  
   const settle = (ms = 400) => p.waitForTimeout(ms);
   const shot = async (n) => { if (shots) { await settle(300); await p.screenshot({ path: path.join(shots, `ide-${n}.png`) }); } };
   const text = (sel) => p.textContent(sel).catch(() => '');
+  // **For what a check prints, not what it tests: an element that is not there is '' at once.** `text` waits for one,
+  // up to Playwright's 30s, and a check's details are read whether it passes or not — so naming `.output` and
+  // `.toast`, neither on screen after a page run, cost a minute every run in 'Run shows a page program'.
+  const peek = (sel) => p.$eval(sel, (e) => e.textContent).catch(() => '');
   const texts = (sel) => p.$$eval(sel, (l) => l.map((x) => x.textContent.trim()));
   const checked = async () => { await settle(500); await p.waitForFunction(() => !document.querySelector('.status').textContent.includes('Checking'), null, { timeout: 60000 }); await settle(200); };
   const editor = () => p.locator('.slot:not(.hidden) .input');
@@ -158,7 +162,7 @@ const check = (ok, what, seen) => { if (!ok) failed++; console.log(`${ok ? 'ok  
   await p.waitForFunction(() => document.querySelector('.pagehost .count') !== null, null, { timeout: 90000 }).catch(() => {});
   const pageShown = (await text('.pagehost')).includes('Clicks: 0');
   if (!pageShown) { await p.locator('.phead .ptab', { hasText: 'Output' }).click().catch(() => {}); await settle(300); }
-  check(pageShown, 'Run shows a page program in the Page panel', [await text('.pagehost'), await text('.output'), await text('.toast')]);
+  check(pageShown, 'Run shows a page program in the Page panel', [await peek('.pagehost'), await peek('.output'), await peek('.toast')]);
   await p.locator('.pagehost .up').click(); await settle(600);
   check((await text('.pagehost .count')) === '1', 'and a click there reaches the program', await text('.pagehost'));
   await shot('3-page');
