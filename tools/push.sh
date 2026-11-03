@@ -22,10 +22,19 @@ branch="$(git rev-parse --abbrev-ref HEAD)"
 for attempt in 1 2 3; do
   git fetch -q origin "$branch" 2>/dev/null && { git merge -q --no-edit "origin/$branch" || exit 1; }
   sh tools/fill-cache.sh || exit 1
-  echo "== check ==" && "$WAC" check src/ide.wac || exit 1
-  echo "== test ==" && "$WAC" task test || exit 1
-  echo "== build ==" && "$WAC" task build || exit 1
-  echo "== test:ide ==" && node tools/ide_test.js || exit 1
+  # **check and test run beside build and test:ide**, which is the long half: test:ide is about 95s and needs only
+  # dist/, and check and test read the sources and write nothing either of the others reads. Measured on 4 cores,
+  # 2026-11-03: the four in a row were about 138s, and this is about the build plus test:ide.
+  out="$(mktemp -d)"
+  "$WAC" check src/ide.wac > "$out/check" 2>&1 & checkPid=$!
+  "$WAC" task test > "$out/test" 2>&1 & testPid=$!
+  echo "== build ==" && "$WAC" task build && echo "== test:ide ==" && node tools/ide_test.js; long=$?
+  wait "$checkPid"; check=$?
+  wait "$testPid"; tested=$?
+  echo "== check ==" && cat "$out/check"
+  echo "== test ==" && cat "$out/test"
+  rm -rf "$out"
+  [ "$check" -eq 0 ] && [ "$tested" -eq 0 ] && [ "$long" -eq 0 ] || exit 1
   if git push -u origin "$branch"; then exit 0; fi
   echo "== push refused: merging what landed and going again ($attempt) =="
 done
