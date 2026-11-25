@@ -1,5 +1,7 @@
 # wac IDE
 
+> **This moved into [voltrevo/wac](https://github.com/voltrevo/wac) as [`projects/ide`](https://github.com/voltrevo/wac/tree/master/projects/ide) on 2026-11-24, with its whole history — including commits that never reached this copy.** Work happens there now. This repository is left as it is, for the older pins that still name its commits.
+
 An IDE for [wac](https://github.com/voltrevo/wac) that runs in a browser tab, with wac's own compiler
 checking your code as you type. Built for real projects, up to the wac repository itself.
 
